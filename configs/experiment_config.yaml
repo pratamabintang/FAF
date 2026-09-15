@@ -16,8 +16,8 @@ seed: 42
 # --- 3. Hardware & System Configuration (Optimized for RTX 2060 Super 8GB) ---
 gpu: 0
 multi_gpu: false
-num_workers: 0                          # In-RAM preloaded streaming (0 IPC overhead on Windows)
-grad_accum_steps: 1                     # Direct step per batch (High GPU saturation)
+num_workers: 4                          # Parallel CPU workers for DataLoader
+grad_accum_steps: 1                     # Direct step per batch
 
 # --- 4. Dataset Configuration (Landslide Multimodal: RGB + DTM) ---
 dataset: "landslide"                    # Options: "landslide" (2 classes) | "mfnet" (9 classes) | "pst900" (5 classes)
@@ -62,9 +62,9 @@ resume: false
 resume_with_reset: false
 resume_from: ""
 
-# --- 6. Training & Optimization (High GPU Throughput: Batch Size 8) ---
+# --- 6. Training & Optimization ---
 epochs: 300
-batch_size: 8                          # 8 samples per batch (~5.5GB VRAM usage on RTX 2060 Super)
+batch_size: 4                          # 4 samples per batch
 optimizer: "adamw"                     # Options: "adamw" | "sgd"
 lr_backbone: 0.00003                   # 3e-5 (fine-tuning pretrained backbone)
 lr_fusion: 0.0003                      # 3e-4

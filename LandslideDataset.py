@@ -79,8 +79,6 @@ class LandslideDataset(Dataset):
         rgb_std: np.ndarray = DEFAULT_RGB_STD,
         include_derivatives: bool = False,
         nodata_value: float = -9999.0,
-        cache_data: bool = True,
-        preload: bool = True,
     ):
         super().__init__()
         self.data_dir = Path(data_dir).resolve()
@@ -94,9 +92,6 @@ class LandslideDataset(Dataset):
         self.rgb_std = np.array(rgb_std, dtype=np.float32)
         self.include_derivatives = include_derivatives
         self.nodata_value = nodata_value
-        self.cache_data = cache_data
-        self.preload = preload
-        self.preloaded_data = []
 
         # Resolve split directory
         split_candidates = [
@@ -121,18 +116,6 @@ class LandslideDataset(Dataset):
         # Index and match triplets
         self.samples = self._index_dataset_triplets()
         print(f"[LandslideDataset] Split: {split.upper()} | Samples: {len(self.samples)} | Dir: {self.split_dir}")
-
-        if self.preload:
-            print(f"[LandslideDataset] Preloading {len(self.samples)} samples into RAM for split '{split.upper()}'...")
-            for sample_meta in self.samples:
-                rgb_raw = self._read_rgb(sample_meta["img_path"])
-                dtm_raw = self._read_dtm(sample_meta["dtm_path"])
-                mask_raw = self._read_mask(sample_meta["lbl_path"], default_shape=dtm_raw.shape)
-                rgb_res, dtm_res, mask_res = self._handle_nodata_and_resize(
-                    rgb_raw, dtm_raw, mask_raw, self.target_h, self.target_w
-                )
-                self.preloaded_data.append((rgb_res, dtm_res, mask_res, sample_meta["stem"]))
-            print(f"[LandslideDataset] Successfully preloaded {len(self.preloaded_data)} samples into RAM.")
 
     def _index_dataset_triplets(self) -> List[Dict[str, Path]]:
         """Finds matching RGB, DTM, and optional LABEL file paths."""
@@ -377,21 +360,18 @@ class LandslideDataset(Dataset):
             mask: int64 Tensor [H, W] (0=Background, 1=Landslide)
             sample_id: str (Stem identifier)
         """
-        if self.preload and index < len(self.preloaded_data):
-            rgb_res, dtm_res, mask_res, sample_id = self.preloaded_data[index]
-            rgb_res = rgb_res.copy()
-            dtm_res = dtm_res.copy()
-            mask_res = mask_res.copy()
-        else:
-            # 1. Read Raw Modalities
-            rgb_raw = self._read_rgb(sample_meta["img_path"])
-            dtm_raw = self._read_dtm(sample_meta["dtm_path"])
-            mask_raw = self._read_mask(sample_meta["lbl_path"], default_shape=dtm_raw.shape)
+        sample_meta = self.samples[index]
+        sample_id = sample_meta["stem"]
 
-            # 2. Synchronous Spatial Resizing with NoData Handling
-            rgb_res, dtm_res, mask_res = self._handle_nodata_and_resize(
-                rgb_raw, dtm_raw, mask_raw, self.target_h, self.target_w
-            )
+        # 1. Read Raw Modalities
+        rgb_raw = self._read_rgb(sample_meta["img_path"])
+        dtm_raw = self._read_dtm(sample_meta["dtm_path"])
+        mask_raw = self._read_mask(sample_meta["lbl_path"], default_shape=dtm_raw.shape)
+
+        # 2. Synchronous Spatial Resizing with NoData Handling
+        rgb_res, dtm_res, mask_res = self._handle_nodata_and_resize(
+            rgb_raw, dtm_raw, mask_raw, self.target_h, self.target_w
+        )
 
         # 3. Training Augmentations
         if self.is_training:

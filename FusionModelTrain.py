@@ -503,9 +503,7 @@ class FusionTrainer:
                 is_training=True,
                 dtm_norm=dtm_norm,
                 dtm_mean=dtm_mean,
-                dtm_std=dtm_std,
-                cache_data=True,
-                preload=True
+                dtm_std=dtm_std
             )
             val_split = "val" if os.path.exists(os.path.join(self.config.data_root, "val")) else "test"
             val_dataset = LandslideDataset(
@@ -515,9 +513,7 @@ class FusionTrainer:
                 is_training=False,
                 dtm_norm=dtm_norm,
                 dtm_mean=dtm_mean,
-                dtm_std=dtm_std,
-                cache_data=True,
-                preload=True
+                dtm_std=dtm_std
             )
         else:
             raise ValueError(f"Unknown dataset: {self.config.dataset}. Choose 'landslide', 'mfnet', or 'pst900'.")
@@ -621,16 +617,11 @@ class FusionTrainer:
         print("Calculating class weights...")
         class_counts = torch.zeros(self.config.num_classes, device=self.device)
 
-        if hasattr(self.train_loader.dataset, 'preloaded_data') and len(self.train_loader.dataset.preloaded_data) > 0:
-            for _, _, mask_np, _ in self.train_loader.dataset.preloaded_data:
-                mask_t = torch.from_numpy(mask_np).to(self.device)
-                valid = (mask_t >= 0) & (mask_t < self.config.num_classes)
-                class_counts += torch.bincount(mask_t[valid], minlength=self.config.num_classes)
-        else:
-            for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
-                mask = mask.to(self.device)
-                valid = (mask >= 0) & (mask < self.config.num_classes)
-                class_counts += torch.bincount(mask[valid], minlength=self.config.num_classes)
+        for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
+            mask = mask.to(self.device)
+            valid = (mask >= 0) & (mask < self.config.num_classes)
+            mask = mask[valid]
+            class_counts += torch.bincount(mask, minlength=self.config.num_classes)
 
         freq = class_counts / class_counts.sum()
 
