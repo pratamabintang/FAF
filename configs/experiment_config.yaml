@@ -16,7 +16,7 @@ seed: 42
 # --- 3. Hardware & System Configuration (Optimized for RTX 2060 Super 8GB) ---
 gpu: 0
 multi_gpu: false
-num_workers: 4                          # Parallel CPU workers for DataLoader
+num_workers: 0                          # In-RAM preloaded streaming (0 IPC overhead on Windows)
 grad_accum_steps: 1                     # Direct step per batch (High GPU saturation)
 
 # --- 4. Dataset Configuration (Landslide Multimodal: RGB + DTM) ---

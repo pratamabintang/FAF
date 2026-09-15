@@ -86,21 +86,22 @@ class ModelEMA:
 
 # ---- Lovasz + Dice + CE (label smoothing) ----
 def lovasz_softmax(logits, labels, classes='present', eps=1e-6):
-    # logits: [B,C,H,W] (ham), labels: [B,H,W]
+    # logits: [B,C,H,W], labels: [B,H,W]
     probs = torch.softmax(logits.float(), dim=1)
     B, C, H, W = probs.shape
+    total_pixels = B * H * W
     losses = []
     for c in range(C):
-        if classes == 'present' and (labels == c).sum() == 0:
-            continue
         fg = (labels == c).float()
+        if classes == 'present' and fg.sum() == 0:
+            continue
         pc = probs[:, c, ...]
         errors = (fg - pc).abs().reshape(-1)
         errors_sorted, perm = torch.sort(errors, descending=True)
         gt_sorted = fg.reshape(-1)[perm]
         grad = torch.cumsum(gt_sorted, 0) / (gt_sorted.sum() + eps)
         grad = 1.0 - grad
-        losses.append(torch.dot(errors_sorted, grad) / (H * W))
+        losses.append(torch.dot(errors_sorted, grad) / total_pixels)
     return torch.stack(losses).mean() if len(losses) else probs.new_tensor(0.)
 
 # ---- Focal Loss for Hard Examples ----
@@ -168,7 +169,6 @@ class ComboLoss3(nn.Module):
         return 1 - dice.mean()
 
     def forward(self, logits, y):
-        # CE + Dice + Lovasz (kaybı fp32'de hesaplayacağız)
         logits = logits.float()
         return (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
@@ -179,9 +179,9 @@ class ComboLoss3(nn.Module):
 class OHEMCrossEntropyLoss(nn.Module):
     """
     Online Hard Example Mining - focuses on hardest pixels.
-    Improves rare class detection by mining difficult examples.
+    Optimized for high GPU throughput without synchronization stalls.
     """
-    def __init__(self, ignore_index=255, thresh=0.7, min_kept=100000, weight=None):
+    def __init__(self, ignore_index=255, thresh=0.7, min_kept=50000, weight=None):
         super().__init__()
         self.ignore_index = ignore_index
         self.thresh = thresh
@@ -189,49 +189,31 @@ class OHEMCrossEntropyLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='none')
     
     def forward(self, logits, targets):
-        # logits: [B, C, H, W], targets: [B, H, W]
         logits = logits.float()
-        B, C, H, W = logits.shape
-        
-        # Calculate per-pixel loss
         loss = self.ce(logits, targets)  # [B, H, W]
         
-        # Flatten
-        loss_flat = loss.view(-1)
-        
-        # Get valid mask (not ignore_index)
         valid_mask = (targets != self.ignore_index).view(-1)
-        loss_flat = loss_flat[valid_mask]
+        loss_flat = loss.view(-1)[valid_mask]
         
         if loss_flat.numel() == 0:
             return loss.mean()
         
-        # Sort losses descending
-        loss_sorted, _ = torch.sort(loss_flat, descending=True)
-        
-        # Find threshold: keep pixels with loss > thresh OR top min_kept
         num_pixels = loss_flat.numel()
         min_kept = min(self.min_kept, num_pixels)
         
-        # Use probability threshold
+        # Fast GPU selection without CPU synchronization
         probs = torch.softmax(logits, dim=1)
-        max_probs, _ = probs.max(dim=1)  # [B, H, W]
+        max_probs, _ = probs.max(dim=1)
         max_probs_flat = max_probs.view(-1)[valid_mask]
         
-        # Pixels where max_prob < thresh are "hard"
         hard_mask = max_probs_flat < self.thresh
-        num_hard = hard_mask.sum().item()
+        if hard_mask.any():
+            hard_loss = loss_flat[hard_mask]
+            if hard_loss.numel() >= min_kept:
+                return hard_loss.mean()
         
-        # Keep at least min_kept or all hard examples
-        k = max(min_kept, num_hard)
-        k = min(k, num_pixels)
-        
-        # Get top-k losses
-        threshold_loss = loss_sorted[int(k) - 1] if k > 0 else loss_sorted[0]
-        
-        # Select hard examples
-        hard_loss = loss_flat[loss_flat >= threshold_loss]
-        
+        # Fallback to top-k hardest pixels (O(N log k), much faster than sorting full tensor)
+        hard_loss, _ = torch.topk(loss_flat, k=min_kept)
         return hard_loss.mean()
 
 
@@ -239,15 +221,14 @@ class OHEMCrossEntropyLoss(nn.Module):
 class BoundaryLoss(nn.Module):
     """
     Boundary-aware loss to improve edge detection.
-    Critical for thin objects like guardrail.
+    Batched depthwise conv implementation for fast execution.
     """
-    def __init__(self, num_classes=9, ignore_index=255, kernel_size=3):
+    def __init__(self, num_classes=2, ignore_index=255, kernel_size=3):
         super().__init__()
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.kernel_size = kernel_size
         
-        # Laplacian kernel for edge detection
         laplacian = torch.tensor([
             [-1, -1, -1],
             [-1,  8, -1],
@@ -256,62 +237,32 @@ class BoundaryLoss(nn.Module):
         self.register_buffer('laplacian', laplacian)
     
     def get_boundary(self, mask):
-        """Extract boundary from segmentation mask"""
         B, H, W = mask.shape
-        
-        # One-hot encode
         one_hot = F.one_hot(mask.clamp(0, self.num_classes - 1), self.num_classes)
         one_hot = one_hot.permute(0, 3, 1, 2).float()  # [B, C, H, W]
-        
-        boundaries = []
-        for c in range(self.num_classes):
-            class_mask = one_hot[:, c:c+1, :, :]  # [B, 1, H, W]
-            # Apply Laplacian to detect edges
-            edges = F.conv2d(class_mask, self.laplacian, padding=1)
-            edges = (edges.abs() > 0.1).float()
-            boundaries.append(edges)
-        
-        # Combine all class boundaries
-        boundary = torch.cat(boundaries, dim=1).max(dim=1, keepdim=True)[0]
-        return boundary.squeeze(1)  # [B, H, W]
+        weight = self.laplacian.to(mask.device).expand(self.num_classes, 1, 3, 3)
+        edges = F.conv2d(one_hot, weight, padding=1, groups=self.num_classes)
+        edges = (edges.abs() > 0.1).float()
+        return edges.max(dim=1)[0]  # [B, H, W]
     
     def forward(self, logits, targets):
-        """
-        Args:
-            logits: [B, C, H, W] model predictions
-            targets: [B, H, W] ground truth
-        """
         logits = logits.float()
-        # Get ground truth boundaries
         gt_boundary = self.get_boundary(targets)  # [B, H, W]
         
-        # Get predicted boundaries from softmax
         probs = torch.softmax(logits, dim=1)
+        weight = self.laplacian.to(probs.device).expand(self.num_classes, 1, 3, 3)
+        edges = F.conv2d(probs, weight, padding=1, groups=self.num_classes)
+        pred_boundary = edges.abs().max(dim=1)[0] * 5.0
         
-        # Compute boundary from predictions
-        pred_boundary = torch.zeros_like(gt_boundary)
-        for c in range(self.num_classes):
-            class_prob = probs[:, c:c+1, :, :]
-            edges = F.conv2d(class_prob, self.laplacian.to(class_prob.device), padding=1)
-            pred_boundary = torch.max(pred_boundary, edges.abs().squeeze(1))
-        
-        # Scale logits (don't apply sigmoid - will be done in BCE with logits)
-        pred_boundary = pred_boundary * 5.0
-        
-        # Binary cross entropy on boundaries
         valid_mask = (targets != self.ignore_index).float()
+        boundary_weight = 1.0 + 2.0 * gt_boundary
         
-        # Focus more on GT boundary regions
-        boundary_weight = 1.0 + 2.0 * gt_boundary  # 3x weight on boundaries
-        
-        # Use BCE with logits (autocast-safe)
         loss = F.binary_cross_entropy_with_logits(
             pred_boundary,
             gt_boundary,
             weight=boundary_weight * valid_mask,
             reduction='sum'
         )
-        
         return loss / (valid_mask.sum() + 1e-6)
 
 
@@ -439,8 +390,8 @@ class FusionTrainer:
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
     
     def setup_directories(self):
         """Create necessary directories"""
@@ -552,7 +503,9 @@ class FusionTrainer:
                 is_training=True,
                 dtm_norm=dtm_norm,
                 dtm_mean=dtm_mean,
-                dtm_std=dtm_std
+                dtm_std=dtm_std,
+                cache_data=True,
+                preload=True
             )
             val_split = "val" if os.path.exists(os.path.join(self.config.data_root, "val")) else "test"
             val_dataset = LandslideDataset(
@@ -562,7 +515,9 @@ class FusionTrainer:
                 is_training=False,
                 dtm_norm=dtm_norm,
                 dtm_mean=dtm_mean,
-                dtm_std=dtm_std
+                dtm_std=dtm_std,
+                cache_data=True,
+                preload=True
             )
         else:
             raise ValueError(f"Unknown dataset: {self.config.dataset}. Choose 'landslide', 'mfnet', or 'pst900'.")
@@ -666,11 +621,16 @@ class FusionTrainer:
         print("Calculating class weights...")
         class_counts = torch.zeros(self.config.num_classes, device=self.device)
 
-        for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
-            mask = mask.to(self.device)
-            valid = (mask >= 0) & (mask < self.config.num_classes)
-            mask = mask[valid]
-            class_counts += torch.bincount(mask, minlength=self.config.num_classes)
+        if hasattr(self.train_loader.dataset, 'preloaded_data') and len(self.train_loader.dataset.preloaded_data) > 0:
+            for _, _, mask_np, _ in self.train_loader.dataset.preloaded_data:
+                mask_t = torch.from_numpy(mask_np).to(self.device)
+                valid = (mask_t >= 0) & (mask_t < self.config.num_classes)
+                class_counts += torch.bincount(mask_t[valid], minlength=self.config.num_classes)
+        else:
+            for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
+                mask = mask.to(self.device)
+                valid = (mask >= 0) & (mask < self.config.num_classes)
+                class_counts += torch.bincount(mask[valid], minlength=self.config.num_classes)
 
         freq = class_counts / class_counts.sum()
 

@@ -263,6 +263,7 @@ def main():
         ]
 
     results = []
+    eff_batch_size = 1 if (device == "cpu" and args.batch_size > 1) else args.batch_size
     for test_cfg in test_matrix:
         passed = run_single_smoke_test(
             model_name=test_cfg["model_name"],
@@ -273,7 +274,7 @@ def main():
             use_cafg=test_cfg["use_cafg"],
             use_tpsw=test_cfg["use_tpsw"],
             deep_supervision=test_cfg["deep_supervision"],
-            batch_size=args.batch_size,
+            batch_size=eff_batch_size,
             height=args.img_height,
             width=args.img_width,
             device=device,
