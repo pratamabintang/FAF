@@ -3,7 +3,7 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:256")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
 import argparse
 import time
 import json
@@ -110,6 +110,7 @@ class FocalLoss(nn.Module):
             logits: (B, C, H, W)
             targets: (B, H, W)
         """
+        logits = logits.float()
         ce_loss = F.cross_entropy(logits, targets, reduction='none', ignore_index=self.ignore_index)
         p = torch.exp(-ce_loss)  # probability
         
@@ -155,6 +156,7 @@ class ComboLoss3(nn.Module):
 
     def forward(self, logits, y):
         # CE + Dice + Lovasz (kaybı fp32'de hesaplayacağız)
+        logits = logits.float()
         return (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
               + self.lovasz_w * lovasz_softmax(logits, y))
@@ -175,6 +177,7 @@ class OHEMCrossEntropyLoss(nn.Module):
     
     def forward(self, logits, targets):
         # logits: [B, C, H, W], targets: [B, H, W]
+        logits = logits.float()
         B, C, H, W = logits.shape
         
         # Calculate per-pixel loss
@@ -265,6 +268,7 @@ class BoundaryLoss(nn.Module):
             logits: [B, C, H, W] model predictions
             targets: [B, H, W] ground truth
         """
+        logits = logits.float()
         # Get ground truth boundaries
         gt_boundary = self.get_boundary(targets)  # [B, H, W]
         
@@ -302,7 +306,7 @@ class BoundaryLoss(nn.Module):
 class ComboLossOHEM(nn.Module):
     """
     Enhanced loss combining: OHEM CE + Dice + Lovasz + Boundary
-    Optimized for rare class detection (guardrail, car_stop, bump)
+    Optimized for rare class detection (guardrail, car_stop, bump, landslide)
     """
     def __init__(self, ce_w=0.4, dice_w=0.2, lovasz_w=0.2, ohem_w=0.1, boundary_w=0.1,
                  class_weights=None, ignore_index=255, num_classes=9,
@@ -329,8 +333,9 @@ class ComboLossOHEM(nn.Module):
         # Initialize Focal Loss if enabled
         if focal_weight > 0:
             self.focal_loss = FocalLoss(gamma=focal_gamma, target_class=focal_target_class, ignore_index=ignore_index)
+            target_name = "landslide" if focal_target_class == 1 else ("guardrail" if focal_target_class == 6 else f"class_{focal_target_class}")
             print(f"[ComboLossOHEM] Weights: CE={ce_w}, Dice={dice_w}, Lovasz={lovasz_w}, OHEM={ohem_w}, Boundary={boundary_w}, Focal={focal_weight}")
-            print(f"[ComboLossOHEM] Focal: gamma={focal_gamma}, target_class={focal_target_class} (guardrail)")
+            print(f"[ComboLossOHEM] Focal: gamma={focal_gamma}, target_class={focal_target_class} ({target_name})")
         else:
             self.focal_loss = None
             print(f"[ComboLossOHEM] Weights: CE={ce_w}, Dice={dice_w}, Lovasz={lovasz_w}, OHEM={ohem_w}, Boundary={boundary_w}")
@@ -348,13 +353,14 @@ class ComboLossOHEM(nn.Module):
         return 1 - dice.mean()
     
     def forward(self, logits, y):
+        logits = logits.float()
         loss = (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
               + self.lovasz_w * lovasz_softmax(logits, y)
               + self.ohem_w * self.ohem(logits, y)
               + self.boundary_w * self.boundary(logits, y))
         
-        # Add Focal Loss if enabled (for guardrail targeting)
+        # Add Focal Loss if enabled
         if self.focal_loss is not None:
             loss = loss + self.focal_w * self.focal_loss(logits, y)
             
@@ -373,6 +379,12 @@ class FusionTrainer:
         self.config = config
         self.device = torch.device(f'cuda:{config.gpu}' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
+
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
         
         # Set random seeds
         self.set_seed(config.seed)
@@ -542,14 +554,19 @@ class FusionTrainer:
         else:
             raise ValueError(f"Unknown dataset: {self.config.dataset}. Choose 'landslide', 'mfnet', or 'pst900'.")
         
+        use_persistent = self.config.num_workers > 0
+        prefetch = 2 if self.config.num_workers > 0 else None
+        
         # Create loaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
-            pin_memory=True,
-            drop_last=True
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+            persistent_workers=use_persistent,
+            prefetch_factor=prefetch
         )
         
         val_loader = DataLoader(
@@ -557,7 +574,9 @@ class FusionTrainer:
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
-            pin_memory=True
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=use_persistent,
+            prefetch_factor=prefetch
         )
         
         print(f"Train samples: {len(train_dataset)}")
@@ -899,26 +918,26 @@ class FusionTrainer:
             ir = ir.to(device=self.device)
             masks = masks.to(device=self.device)
             
-            with autocast('cuda', enabled=True): #with autocast('cuda',dtype=torch.bfloat16):#
+            with autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
                 main_out, aux_out = self.model(rgb, ir)
                 
-                # Calculate losses
-                loss_main = self.criterion_main(main_out, masks)
+                # Calculate losses (in float32 for numerical stability)
+                loss_main = self.criterion_main(main_out.float(), masks)
                 
                 # Handle deep supervision (PANet decoder returns dict during training)
                 if isinstance(aux_out, dict):
                     # PANet deep supervision format: {'aux': tensor, 'deep': [t0, t1, t2, t3]}
-                    loss_aux = self.criterion_aux(aux_out['aux'], masks)
+                    loss_aux = self.criterion_aux(aux_out['aux'].float(), masks) if aux_out.get('aux') is not None else 0
                     
                     # Add deep supervision losses (weighted by level, deeper = lower weight)
                     deep_outputs = aux_out.get('deep', [])
                     deep_weights = [0.1, 0.2, 0.3, 0.4]  # Level 0->3: increasing importance
                     for i, deep_out in enumerate(deep_outputs):
                         weight = deep_weights[i] if i < len(deep_weights) else 0.1
-                        loss_aux = loss_aux + weight * self.criterion_aux(deep_out, masks)
+                        loss_aux = loss_aux + weight * self.criterion_aux(deep_out.float(), masks)
                 else:
                     # Standard FPN format: aux_out is a tensor
-                    loss_aux = self.criterion_aux(aux_out, masks) if aux_out is not None else 0
+                    loss_aux = self.criterion_aux(aux_out.float(), masks) if aux_out is not None else 0
                 
                 # Combined loss
                 loss = loss_main + aux_weight * loss_aux
@@ -986,16 +1005,16 @@ class FusionTrainer:
                 ir = ir.to(self.device) 
                 masks = masks.to(self.device)
                 
-                with autocast(device_type='cuda', enabled=True):
+                with autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
                     main_out, aux_out = self.model(rgb, ir)
                 
-                loss_main = self.criterion_main(main_out, masks)
+                loss_main = self.criterion_main(main_out.float(), masks)
                 
                 # Handle deep supervision output format
                 if isinstance(aux_out, dict):
-                    loss_aux = self.criterion_aux(aux_out['aux'], masks)
+                    loss_aux = self.criterion_aux(aux_out['aux'].float(), masks) if aux_out.get('aux') is not None else 0
                 else:
-                    loss_aux = self.criterion_aux(aux_out, masks) if aux_out is not None else 0
+                    loss_aux = self.criterion_aux(aux_out.float(), masks) if aux_out is not None else 0
                 
                 loss = loss_main + aux_weight * loss_aux
                 running_loss += loss.item()

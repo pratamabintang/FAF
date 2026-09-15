@@ -38,6 +38,10 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
+# Prevent OpenCV thread contention across DataLoader workers
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 # Default Normalization Statistics (Empirical statistics from dataset_1 train split)
 DEFAULT_RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DEFAULT_RGB_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -201,38 +205,49 @@ class LandslideDataset(Dataset):
         Applies bilinear interpolation for continuous data (RGB, DTM) and
         nearest-neighbor for discrete data (Mask, Validity Map).
         Handles NaNs and NoData prior to and post-interpolation.
+        Fast-path avoids redundant resize and median calculation when data is already clean and correct size.
         """
-        # 1. Identify validity mask for DTM (non-NaN, non-Inf, > nodata)
-        valid_mask = (~np.isnan(dtm)) & (~np.isinf(dtm)) & (dtm > self.nodata_value)
+        # Fast check: does DTM have invalid / NaN / NoData pixels?
+        has_invalid = np.isnan(dtm).any() or np.isinf(dtm).any() or (dtm <= self.nodata_value).any()
 
-        # 2. Fill invalid values before bilinear interpolation to avoid NaN bleeding
-        valid_pixels = dtm[valid_mask]
-        fill_val = float(np.median(valid_pixels)) if len(valid_pixels) > 0 else 0.0
-        dtm_clean = np.where(valid_mask, dtm, fill_val)
+        if has_invalid:
+            valid_mask = (~np.isnan(dtm)) & (~np.isinf(dtm)) & (dtm > self.nodata_value)
+            valid_pixels = dtm[valid_mask]
+            fill_val = float(np.median(valid_pixels)) if len(valid_pixels) > 0 else 0.0
+            dtm_clean = np.where(valid_mask, dtm, fill_val)
+        else:
+            dtm_clean = dtm
+            fill_val = 0.0
 
-        # 3. Bilinear Interpolation for RGB
-        rgb_resized = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        h, w = rgb.shape[:2]
+        if (h, w) != (target_h, target_w):
+            # Bilinear Interpolation for RGB
+            rgb_resized = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
-        # 4. Bilinear Interpolation for continuous DTM
-        dtm_resized = cv2.resize(dtm_clean, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            # Bilinear Interpolation for continuous DTM
+            dtm_resized = cv2.resize(dtm_clean, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
-        # 5. Nearest-Neighbor Interpolation for discrete Mask and Validity Map
-        mask_resized = cv2.resize(
-            mask.astype(np.uint8),
-            (target_w, target_h),
-            interpolation=cv2.INTER_NEAREST
-        ).astype(np.int64)
+            # Nearest-Neighbor Interpolation for discrete Mask
+            mask_resized = cv2.resize(
+                mask.astype(np.uint8),
+                (target_w, target_h),
+                interpolation=cv2.INTER_NEAREST
+            ).astype(np.int64)
 
-        valid_mask_resized = cv2.resize(
-            valid_mask.astype(np.uint8),
-            (target_w, target_h),
-            interpolation=cv2.INTER_NEAREST
-        ).astype(bool)
-
-        # 6. Post-resize NoData & NaN verification
-        dtm_resized = np.nan_to_num(dtm_resized, nan=fill_val, posinf=fill_val, neginf=fill_val)
-        # Restore filled sentinel if completely outside valid domain
-        dtm_resized = np.where(valid_mask_resized, dtm_resized, fill_val)
+            if has_invalid:
+                valid_mask_resized = cv2.resize(
+                    valid_mask.astype(np.uint8),
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
+                dtm_resized = np.nan_to_num(dtm_resized, nan=fill_val, posinf=fill_val, neginf=fill_val)
+                dtm_resized = np.where(valid_mask_resized, dtm_resized, fill_val)
+            else:
+                dtm_resized = np.nan_to_num(dtm_resized, nan=fill_val, posinf=fill_val, neginf=fill_val)
+        else:
+            rgb_resized = rgb
+            dtm_resized = np.nan_to_num(dtm_clean, nan=fill_val, posinf=fill_val, neginf=fill_val)
+            mask_resized = mask.astype(np.int64)
 
         return rgb_resized, dtm_resized, mask_resized
 
