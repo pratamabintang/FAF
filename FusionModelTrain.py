@@ -642,22 +642,23 @@ class FusionTrainer:
         freq = class_counts / class_counts.sum()
 
         print("Class pixel frequencies:")
-        for i,f in enumerate(freq):
-            print(f"  Class {i}: {f:.6f}")
+        for i, f in enumerate(freq):
+            print(f"  Class {i}: {f.item():.6f}")
 
-        # Landslide-specific: Ensure positive landslide class has direct strong weight (1.0 vs Multiplier)
-        if self.config.dataset == 'landslide' and self.config.num_classes == 2:
-            multiplier = getattr(self.config, 'class_weight_multiplier', 10.0)
-            weights = torch.tensor([1.0, float(multiplier)], device=self.device)
-            print(f"[INFO] Landslide class weights: Background=1.0000, Landslide={multiplier:.4f}")
-            return weights
+        # Dynamic Inverse Frequency Weighting from computed pixel frequencies
+        # w_c = (freq_0 / freq_c), normalized so Background (class 0) = 1.0
+        # Uses square-root smoothing (Median Frequency Balancing) to keep training stable
+        inv_freq = 1.0 / (freq + 1e-6)
+        raw_weights = inv_freq / inv_freq[0]  # Base background = 1.0000
+        
+        # Smoothed inverse frequency (square root) scaled by class_weight_multiplier ratio
+        multiplier = getattr(self.config, 'class_weight_multiplier', 10.0)
+        smoothed_ratio = torch.sqrt(raw_weights) * (multiplier / 10.0)
+        weights = torch.tensor([1.0, float(smoothed_ratio[1].clamp(min=2.0, max=50.0))], device=self.device)
 
-        # Note: Manual weight overrides removed for multi-dataset compatibility
-        # If needed for specific datasets, add conditional logic based on num_classes
-
-        print("Final Class Weights:")
-        for i,w in enumerate(weights):
-            print(f"  Class {i}: {w:.4f}")
+        print("Final Computed Class Weights (from Dataset Frequencies):")
+        print(f"  Class 0 (Background): {weights[0].item():.4f}")
+        print(f"  Class 1 (Landslide) : {weights[1].item():.4f} (Derived from {freq[1].item()*100:.2f}% pixel frequency)")
 
         return weights
     
