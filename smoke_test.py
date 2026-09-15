@@ -3,8 +3,8 @@
 Frequency-Aware Fusion (FAF) - Comprehensive Smoke Test Suite
 ================================================================================
 Test Specification:
-  - Input RGB  : [B, 3, H, W]  (default B=2, H=480, W=640)
-  - Input DTM  : [B, 1, H, W]  (default B=2, H=480, W=640)
+  - Input RGB  : [B, 3, H, W]  (default B=2, H=512, W=512)
+  - Input DTM  : [B, 1, H, W]  (default B=2, H=512, W=512)
   - Output Logits : [B, 2, H, W]  (Binary Landslide Segmentation)
 
 Verification Criteria (P0):
@@ -15,7 +15,7 @@ Verification Criteria (P0):
 
 Usage:
   python smoke_test.py
-  python smoke_test.py --device cuda --batch_size 2 --img_height 480 --img_width 640
+  python smoke_test.py --device cuda --batch_size 2 --img_height 512 --img_width 512
   python smoke_test.py --arch convnextv2_tiny.fcmae_ft_in22k_in1k_384 --use_safd --use_cafg
 ================================================================================
 """
@@ -26,6 +26,9 @@ import gc
 import argparse
 import traceback
 from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -52,9 +55,6 @@ def run_single_smoke_test(
     device: str,
     num_classes: int = 2,
 ) -> bool:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
     from FusionModel import FusionModel, get_backbone_context_dim
 
     print("\n" + "-" * 80)
@@ -186,8 +186,8 @@ def run_single_smoke_test(
 def main():
     parser = argparse.ArgumentParser(description="FAF Landslide Fusion Model Smoke Test Suite")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size (default: 2)")
-    parser.add_argument("--img_height", type=int, default=480, help="Input height (default: 480)")
-    parser.add_argument("--img_width", type=int, default=640, help="Input width (default: 640)")
+    parser.add_argument("--img_height", type=int, default=512, help="Input height (default: 512)")
+    parser.add_argument("--img_width", type=int, default=512, help="Input width (default: 512)")
     parser.add_argument("--num_classes", type=int, default=2, help="Number of classes (default: 2 for binary segmentation)")
     parser.add_argument("--arch", type=str, default="convnextv2_tiny.fcmae_ft_in22k_in1k_384",
                         help="Backbone architecture (nano, tiny, or base)")
@@ -198,7 +198,6 @@ def main():
     args = parser.parse_args()
 
     # Determine device
-    import torch
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
