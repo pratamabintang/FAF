@@ -6,7 +6,6 @@
 # --- 1. Experiment & Logging Metadata ---
 exp_name: "faf_landslide_experiment_v1"
 exp_dir: "Experiments"
-save_interval: 50
 log_interval: 10
 verbose: true
 use_wandb: false

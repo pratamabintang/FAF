@@ -8,6 +8,7 @@ import argparse
 import time
 import json
 import random
+import cv2
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -21,15 +22,27 @@ from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 from tqdm import tqdm
-import wandb  # Optional: for experiment tracking
 
-# Import your models
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+# Import models & datasets
 from FusionModel import FusionModel
-from FusionModelDataset import FusionModelDataset
-from PST900Dataset import PST900Dataset
 from LandslideDataset import LandslideDataset
 from FusionModelUtils import compute_results
 from sklearn.metrics import confusion_matrix
+
+try:
+    from FusionModelDataset import FusionModelDataset
+except ImportError:
+    FusionModelDataset = None
+
+try:
+    from PST900Dataset import PST900Dataset
+except ImportError:
+    PST900Dataset = None
 
 
 # ---- EMA (Exponential Moving Average) ----
@@ -1059,11 +1072,22 @@ class FusionTrainer:
             "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
         }
 
+        # 1. Always save latest checkpoint (atomic save to prevent corrupted files)
         latest_path = self.checkpoint_dir / "latest.pth"
         tmp_path = self.checkpoint_dir / "latest.tmp"
-        #torch.save(ckpt, tmp_path)
-        #os.replace(tmp_path, latest_path)
+        try:
+            torch.save(ckpt, tmp_path)
+            if latest_path.exists():
+                try:
+                    os.remove(latest_path)
+                except Exception:
+                    pass
+            os.replace(tmp_path, latest_path)
+        except Exception as e:
+            # Fallback direct save if atomic replace has OS lock issues
+            torch.save(ckpt, latest_path)
 
+        # 2. Save best eval checkpoint and best EMA checkpoint
         if is_best:
             torch.save(ckpt, self.checkpoint_dir / "best.pth")
             # --- Save EMA full model separately ---
@@ -1076,15 +1100,12 @@ class FusionTrainer:
                 torch.save({
                     "epoch": epoch,
                     "model_state_dict": full_state,
-                    "config": vars(self.config),
+                    "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
                     "best_miou": float(self.best_miou)
                 }, self.checkpoint_dir / "best_model.ema.pth")
-                print("[INFO] EMA FULL model saved as best_model.ema.pth")
+                print(f"[INFO] New best mIoU: {self.best_miou:.4f} | Saved best.pth and best_model.ema.pth")
                 # 4) Restore original weights
-                self.ema.restore(self.model)
-
-        if getattr(self.config, "save_interval", 0) and epoch % self.config.save_interval == 0:
-            torch.save(ckpt, self.checkpoint_dir / f"epoch_{epoch}.pth")  
+                self.ema.restore(self.model)  
 
     def resume_from_best_with_reset(self):
         # Use custom path if provided, otherwise
