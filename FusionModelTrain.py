@@ -90,6 +90,20 @@ def lovasz_softmax(logits, labels, classes='present', eps=1e-6):
     probs = torch.softmax(logits.float(), dim=1)
     B, C, H, W = probs.shape
     total_pixels = B * H * W
+    
+    if C == 2:
+        # Binary Landslide: optimize foreground (Class 1) directly
+        fg = (labels == 1).float()
+        if fg.sum() == 0:
+            return probs.new_tensor(0.)
+        pc = probs[:, 1, ...]
+        errors = (fg - pc).abs().reshape(-1)
+        errors_sorted, perm = torch.sort(errors, descending=True)
+        gt_sorted = fg.reshape(-1)[perm]
+        grad = torch.cumsum(gt_sorted, 0) / (gt_sorted.sum() + eps)
+        grad = 1.0 - grad
+        return torch.dot(errors_sorted, grad) / (B * H * W)
+    
     losses = []
     for c in range(C):
         fg = (labels == c).float()
@@ -111,7 +125,7 @@ class FocalLoss(nn.Module):
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
     Focuses training on hard, misclassified examples.
     """
-    def __init__(self, gamma=2.0, alpha=None, target_class=None, ignore_index=255):
+    def __init__(self, gamma=2.0, alpha=None, target_class=1, ignore_index=255):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
@@ -119,30 +133,20 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
         
     def forward(self, logits, targets):
-        """
-        Args:
-            logits: (B, C, H, W)
-            targets: (B, H, W)
-        """
         logits = logits.float()
         ce_loss = F.cross_entropy(logits, targets, reduction='none', ignore_index=self.ignore_index)
-        p = torch.exp(-ce_loss)  # probability
+        p = torch.exp(-ce_loss.clamp(max=20.0))  # probability
+        focal_weight = (1.0 - p) ** self.gamma
         
-        # Focal weight: (1 - p)^gamma - focuses on hard examples
-        focal_weight = (1 - p) ** self.gamma
-        
-        # If target_class specified (>= 0), only apply to that class
         if self.target_class is not None and self.target_class >= 0:
             mask = (targets == self.target_class).float()
-            focal_loss = focal_weight * ce_loss * mask
-            return focal_loss.sum() / (mask.sum() + 1e-8)
+            if mask.sum() > 0:
+                focal_loss = focal_weight * ce_loss * mask
+                return focal_loss.sum() / (mask.sum() + 1e-8)
+            else:
+                return ce_loss.new_tensor(0.0)
         else:
-            # Apply to all classes (target_class is None or -1)
             focal_loss = focal_weight * ce_loss
-            if self.alpha is not None:
-                if isinstance(self.alpha, (list, np.ndarray)):
-                    alpha_t = torch.tensor(self.alpha, device=logits.device)[targets]
-                    focal_loss = alpha_t * focal_loss
             return focal_loss.mean()
 
 class ComboLoss3(nn.Module):
@@ -155,18 +159,22 @@ class ComboLoss3(nn.Module):
     def dice(self, logits, y, eps=1e-6):
         logits = logits.float()
         C = logits.shape[1]
+        probs = torch.softmax(logits, dim=1)
+        
+        if C == 2:
+            # Binary segmentation: Focus Dice directly on positive landslide foreground (Class 1)
+            p_fg = probs[:, 1, ...]
+            y_fg = (y == 1).float()
+            inter = (p_fg * y_fg).sum(dim=(1, 2))
+            union = p_fg.sum(dim=(1, 2)) + y_fg.sum(dim=(1, 2))
+            dice = (2.0 * inter + eps) / (union + eps)
+            return 1.0 - dice.mean()
+        
         y1h = F.one_hot(y.clamp_min(0), C).permute(0,3,1,2).float()
-        p = torch.softmax(logits, dim=1)
-
-        inter = (p * y1h).sum(dim=(0,2,3))
-        union = p.sum(dim=(0,2,3)) + y1h.sum(dim=(0,2,3))
-
+        inter = (probs * y1h).sum(dim=(0,2,3))
+        union = probs.sum(dim=(0,2,3)) + y1h.sum(dim=(0,2,3))
         dice = (2*inter + eps) / (union + eps)
-
-        if self.ce.weight is not None:
-            dice = dice * self.ce.weight.to(dice.device)
-
-        return 1 - dice.mean()
+        return 1.0 - dice.mean()
 
     def forward(self, logits, y):
         logits = logits.float()
@@ -307,14 +315,22 @@ class ComboLossOHEM(nn.Module):
     def dice(self, logits, y, eps=1e-6):
         logits = logits.float()
         C = logits.shape[1]
+        probs = torch.softmax(logits, dim=1)
+        
+        if C == 2:
+            # Binary Landslide: optimize foreground (Class 1) directly
+            p_fg = probs[:, 1, ...]
+            y_fg = (y == 1).float()
+            inter = (p_fg * y_fg).sum(dim=(1, 2))
+            union = p_fg.sum(dim=(1, 2)) + y_fg.sum(dim=(1, 2))
+            dice = (2.0 * inter + eps) / (union + eps)
+            return 1.0 - dice.mean()
+        
         y1h = F.one_hot(y.clamp_min(0), C).permute(0,3,1,2).float()
-        p = torch.softmax(logits, dim=1)
-        
-        inter = (p * y1h).sum(dim=(0,2,3))
-        union = p.sum(dim=(0,2,3)) + y1h.sum(dim=(0,2,3))
-        
+        inter = (probs * y1h).sum(dim=(0,2,3))
+        union = probs.sum(dim=(0,2,3)) + y1h.sum(dim=(0,2,3))
         dice = (2*inter + eps) / (union + eps)
-        return 1 - dice.mean()
+        return 1.0 - dice.mean()
     
     def forward(self, logits, y):
         logits = logits.float()
@@ -629,42 +645,12 @@ class FusionTrainer:
         for i,f in enumerate(freq):
             print(f"  Class {i}: {f:.6f}")
 
-        # --- BALANCED INVERSE FREQUENCY WEIGHTING ---
-        # This gives high weights to rare classes but keeps it balanced
-        
-        # Step 1: Calculate inverse frequency weights
-        # weight[i] = total_pixels / (num_classes * class_pixels[i])
-        total_pixels = class_counts.sum()
-        num_classes = self.config.num_classes
-        weights = total_pixels / (num_classes * class_counts.clamp(min=1))
-        
-        # Step 2: Normalize so max weight = 1.0
-        weights = weights / weights.max()
-        
-        # Step 3: Scale up (configurable via --class_weight_multiplier)
-        # Default: 10.0 for balanced, 5.0 for full diversity
-        weight_multiplier = getattr(self.config, 'class_weight_multiplier', 10.0)
-        weights = weights * weight_multiplier
-        
-        # Step 4: Clamp to reasonable range
-        # Min 0.5 (for very common classes), Max 10.0 (for very rare)
-        weights = torch.clamp(weights, 0.5, 15.0)
-
-        # PST900-specific: Boost Hand Drill (Class 3) - rarest and hardest class
-        if self.config.dataset == 'pst900' and self.config.num_classes == 5:
-            print("[INFO] Applying PST900-specific boost for Hand Drill (Class 3)...")
-            weights[3] *= 1.3  # Hand Drill boost (reduced from 1.5 to 1.3 for stability)
-            print(f"  Hand Drill weight boosted: {weights[3]:.2f}")
-
-        # MFNet-specific: Boost weak classes (Car Stop, Guardrail, Bump)
-        if self.config.dataset == 'mfnet' and self.config.num_classes == 9:
-            print("[INFO] Applying MFNet-specific boosts for weak classes...")
-            weights[5] *= 1.4  # Car Stop boost
-            weights[6] *= 2.0  # Guardrail boost (very rare)
-            weights[8] *= 1.3  # Bump boost
-            print(f"  Car Stop (5) weight boosted: {weights[5]:.2f}")
-            print(f"  Guardrail (6) weight boosted: {weights[6]:.2f}")
-            print(f"  Bump (8) weight boosted: {weights[8]:.2f}")
+        # Landslide-specific: Ensure positive landslide class has direct strong weight (1.0 vs Multiplier)
+        if self.config.dataset == 'landslide' and self.config.num_classes == 2:
+            multiplier = getattr(self.config, 'class_weight_multiplier', 10.0)
+            weights = torch.tensor([1.0, float(multiplier)], device=self.device)
+            print(f"[INFO] Landslide class weights: Background=1.0000, Landslide={multiplier:.4f}")
+            return weights
 
         # Note: Manual weight overrides removed for multi-dataset compatibility
         # If needed for specific datasets, add conditional logic based on num_classes
@@ -1191,8 +1177,11 @@ class FusionTrainer:
             
             # Log class-wise IoU
             if self.config.verbose:
-                class_names = ['unlabeled', 'car', 'person', 'bike', 'curve', 
-                              'car_stop', 'guardrail', 'color_cone', 'bump']
+                if self.config.num_classes == 2:
+                    class_names = ['Background', 'Landslide']
+                else:
+                    class_names = ['unlabeled', 'car', 'person', 'bike', 'curve', 
+                                  'car_stop', 'guardrail', 'color_cone', 'bump']
                 for i, iou in enumerate(class_ious):
                     if i < len(class_names):
                         print(f"  {class_names[i]}: {iou:.4f}")
