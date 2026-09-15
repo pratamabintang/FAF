@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import Tuple, List
 import numpy as np
 from PIL import Image
@@ -7,6 +8,8 @@ import torch
 from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
+warnings.filterwarnings("ignore", category=UserWarning, module="albumentations")
 
 # --- PST900 Statistics (Computed from training set) ---
 RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)  # ImageNet stats

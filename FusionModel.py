@@ -719,21 +719,25 @@ class ThermalPriorModule(nn.Module):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
+            nn.GroupNorm(num_groups=4, num_channels=16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, 1, bias=False),
             nn.Sigmoid()
         )
 
-    def forward(self, raw_ir, target_sizes):
+    def forward(self, raw_ir, target_sizes=None):
         """
         Args:
             raw_ir: [B, 1, H, W] raw thermal input image
-            target_sizes: list of (H, W) for each feature scale
+            target_sizes: optional list of (H, W) for each feature scale.
+                          If None, defaults to 4 downscaled pyramid stages [H/4, H/8, H/16, H/32].
         Returns:
             priors: list of [B, 1, Hi, Wi] thermal prior maps
         """
         prior = self.encoder(raw_ir)  # [B, 1, H, W] full-res prior
+        if target_sizes is None:
+            H, W = raw_ir.shape[2], raw_ir.shape[3]
+            target_sizes = [(H // 4, W // 4), (H // 8, W // 8), (H // 16, W // 16), (H // 32, W // 32)]
         priors = []
         for size in target_sizes:
             p = F.interpolate(prior, size=size, mode='bilinear', align_corners=False)

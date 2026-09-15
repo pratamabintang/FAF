@@ -13,6 +13,9 @@ Usage:
 import os
 import sys
 import unittest
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="albumentations")
 
 def main():
     print("=" * 80)
