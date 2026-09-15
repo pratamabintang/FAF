@@ -1,0 +1,108 @@
+# ==============================================================================
+# Git Ignore Configuration for Frequency-Aware Fusion (FAF) Project
+# ==============================================================================
+
+# --- 1. Datasets & Large Rasters / Annotations ---
+dataset/
+data/
+datasets/
+*.tif
+*.tiff
+*.geotiff
+*.mat
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# --- 2. Training Runs, Outputs, Logs & Visualizations ---
+runs/
+Experiments/
+checkpoints/
+weights/
+logs/
+demo_results/
+visualizations/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.log
+events.out.tfevents.*
+tensorboard/
+wandb/
+
+# --- 3. Python Cache & Build Artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- 4. Testing & Coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+htmlcov/
+*.cover
+
+# --- 5. Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+conda_env/
+
+# --- 6. IDEs & Editors ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# --- 7. Operating System Artifacts ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- 8. Temporary & Scratch Files ---
+tmp/
+temp/
+scratch/
