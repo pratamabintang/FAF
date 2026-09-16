@@ -198,7 +198,7 @@ class TestModelArchitecture(unittest.TestCase):
 
     def test_loss_functions_stability(self):
         """Verify BoundaryLoss, OHEMCrossEntropyLoss, and ComboLoss3 are finite and non-negative."""
-        from FusionModelTrain import BoundaryLoss, OHEMCrossEntropyLoss, ComboLoss3
+        from FusionModelTrain import BoundaryLoss, OHEMCrossEntropyLoss, ComboLoss3, ComboLossOHEM
 
         B, C, H, W = 2, 2, 32, 32
         logits = torch.randn(B, C, H, W, requires_grad=True)
@@ -225,6 +225,21 @@ class TestModelArchitecture(unittest.TestCase):
         self.assertFalse(torch.isnan(c_loss))
         self.assertFalse(torch.isinf(c_loss))
         self.assertGreaterEqual(c_loss.item(), 0.0)
+
+        # 4. ComboLoss3 and ComboLossOHEM with NoData ignore_index (-100)
+        targets_with_nodata = targets.clone()
+        targets_with_nodata[:, :4, :4] = -100
+        c_loss_nodata = combo3(logits, targets_with_nodata)
+        self.assertFalse(torch.isnan(c_loss_nodata))
+        self.assertFalse(torch.isinf(c_loss_nodata))
+        self.assertGreaterEqual(c_loss_nodata.item(), 0.0)
+
+        combo_ohem = ComboLossOHEM(ce_w=0.35, dice_w=0.35, lovasz_w=0.30, ohem_w=0.1, boundary_w=0.1,
+                                   class_weights=class_weights, ignore_index=-100, num_classes=2)
+        co_loss = combo_ohem(logits, targets_with_nodata)
+        self.assertFalse(torch.isnan(co_loss))
+        self.assertFalse(torch.isinf(co_loss))
+        self.assertGreaterEqual(co_loss.item(), 0.0)
 
     def test_dynamic_in_chans_adaptation(self):
         """Verify FusionModel initializes and runs forward pass with 4-channel terrain input."""

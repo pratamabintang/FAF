@@ -85,24 +85,28 @@ class ModelEMA:
             self.shadow[k] = v.clone().to(device)
 
 # ---- Lovasz + Dice + CE (label smoothing) ----
-def lovasz_softmax(logits, labels, classes='present', eps=1e-6):
+def lovasz_softmax(logits, labels, classes='present', eps=1e-6, ignore_index=-100):
     # logits: [B,C,H,W], labels: [B,H,W]
     probs = torch.softmax(logits.float(), dim=1)
     B, C, H, W = probs.shape
-    total_pixels = B * H * W
+    valid = (labels != ignore_index)
     
     if C == 2:
         # Binary Landslide: optimize foreground (Class 1) directly
         fg = (labels == 1).float()
-        if fg.sum() == 0:
+        if fg.sum() == 0 or not valid.any():
             return probs.new_tensor(0.)
         pc = probs[:, 1, ...]
-        errors = (fg - pc).abs().reshape(-1)
+        fg_valid = fg[valid]
+        pc_valid = pc[valid]
+        if fg_valid.numel() == 0 or fg_valid.sum() == 0:
+            return probs.new_tensor(0.)
+        errors = (fg_valid - pc_valid).abs()
         errors_sorted, perm = torch.sort(errors, descending=True)
-        gt_sorted = fg.reshape(-1)[perm]
+        gt_sorted = fg_valid[perm]
         grad = torch.cumsum(gt_sorted, 0) / (gt_sorted.sum() + eps)
         grad = 1.0 - grad
-        return torch.dot(errors_sorted, grad) / (B * H * W)
+        return torch.dot(errors_sorted, grad) / max(fg_valid.numel(), 1)
     
     losses = []
     for c in range(C):
@@ -154,6 +158,7 @@ class ComboLoss3(nn.Module):
                  class_weights=None, ignore_index=-100, label_smoothing=0.05):
         super().__init__()
         ignore_index = -100 if ignore_index is None else ignore_index
+        self.ignore_index = ignore_index
         self.ce = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ignore_index, label_smoothing=label_smoothing)
         self.ce_w, self.dice_w, self.lovasz_w = ce_w, dice_w, lovasz_w
 
@@ -161,11 +166,12 @@ class ComboLoss3(nn.Module):
         logits = logits.float()
         C = logits.shape[1]
         probs = torch.softmax(logits, dim=1)
+        valid = (y != self.ignore_index).float()
         
         if C == 2:
             # Binary segmentation: Focus Dice directly on positive landslide foreground (Class 1)
-            p_fg = probs[:, 1, ...]
-            y_fg = (y == 1).float()
+            p_fg = probs[:, 1, ...] * valid
+            y_fg = (y == 1).float() * valid
             inter = (p_fg * y_fg).sum(dim=(1, 2))
             union = p_fg.sum(dim=(1, 2)) + y_fg.sum(dim=(1, 2))
             dice = (2.0 * inter + eps) / (union + eps)
@@ -186,7 +192,7 @@ class ComboLoss3(nn.Module):
         logits = logits.float()
         return (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
-              + self.lovasz_w * lovasz_softmax(logits, y))
+              + self.lovasz_w * lovasz_softmax(logits, y, ignore_index=self.ignore_index))
 
 
 # ---- OHEM (Online Hard Example Mining) Loss ----
@@ -292,6 +298,7 @@ class ComboLossOHEM(nn.Module):
                  focal_weight=0.0, focal_gamma=2.0, focal_target_class=6):
         super().__init__()
         
+        self.ignore_index = ignore_index
         self.ce = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ignore_index)
         self.ohem = OHEMCrossEntropyLoss(
             ignore_index=ignore_index, 
@@ -323,10 +330,12 @@ class ComboLossOHEM(nn.Module):
         C = logits.shape[1]
         probs = torch.softmax(logits, dim=1)
         
+        valid = (y != self.ignore_index).float()
+
         if C == 2:
             # Binary Landslide: optimize foreground (Class 1) directly
-            p_fg = probs[:, 1, ...]
-            y_fg = (y == 1).float()
+            p_fg = probs[:, 1, ...] * valid
+            y_fg = (y == 1).float() * valid
             inter = (p_fg * y_fg).sum(dim=(1, 2))
             union = p_fg.sum(dim=(1, 2)) + y_fg.sum(dim=(1, 2))
             dice = (2.0 * inter + eps) / (union + eps)
@@ -347,7 +356,7 @@ class ComboLossOHEM(nn.Module):
         logits = logits.float()
         loss = (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
-              + self.lovasz_w * lovasz_softmax(logits, y)
+              + self.lovasz_w * lovasz_softmax(logits, y, ignore_index=self.ignore_index)
               + self.ohem_w * self.ohem(logits, y)
               + self.boundary_w * self.boundary(logits, y))
         
@@ -926,14 +935,16 @@ class FusionTrainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.config.epochs}')
         self.optimizer.zero_grad(set_to_none=True)
 
+        ignore_idx = 0 if getattr(self.config, 'ignore_unlabeled', False) else -100
+
         for batch_idx, (rgb, ir, masks,_) in enumerate(pbar):
-            # Fail-fast validation on label values instead of silent clamping
-            valid_mask_values = (masks >= 0) & (masks < self.config.num_classes)
+            # Fail-fast validation on label values: allow valid class IDs or ignore_index (-100)
+            valid_mask_values = ((masks >= 0) & (masks < self.config.num_classes)) | (masks == ignore_idx)
             if not valid_mask_values.all():
                 invalid_vals = torch.unique(masks[~valid_mask_values]).tolist()
                 raise ValueError(
                     f"Unexpected label values found in batch {batch_idx}: {invalid_vals}. "
-                    f"Expected classes in [0, {self.config.num_classes - 1}]."
+                    f"Expected classes in [0, {self.config.num_classes - 1}] or ignore_index ({ignore_idx})."
                 )
 
             rgb = rgb.to(device=self.device)
@@ -1048,8 +1059,10 @@ class FusionTrainer:
                 for pred, label in zip(preds, labels):
                     label = label.flatten()
                     pred = pred.flatten()
-                    conf = confusion_matrix(y_true=label, y_pred=pred, labels=list(range(self.config.num_classes)))
-                    conf_total += conf
+                    valid = (label >= 0) & (label < self.config.num_classes)
+                    if np.any(valid):
+                        conf = confusion_matrix(y_true=label[valid], y_pred=pred[valid], labels=list(range(self.config.num_classes)))
+                        conf_total += conf
                     
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
