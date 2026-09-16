@@ -48,11 +48,7 @@ rgb_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
 ir_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
 context_dim: "[96,192,384,768]"
 modal_mode: "multimodal"
-fusion_strategy: "average_summation"
-fuse_type: "scalar"
-distill_type: "mul"
 freeze_backbones: false
-distill_layers_enabled: false
 
 # Full FAF Proposed Architecture
 decoder_type: "panet"
@@ -82,7 +78,6 @@ clip_grad: 0.1
 # Learning Rate Scheduler
 scheduler: "cosine_warmup"
 warmup_epochs: 10
-flat_epochs: 10
 t0: 50
 step_size: 45
 

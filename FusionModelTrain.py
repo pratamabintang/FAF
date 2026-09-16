@@ -493,13 +493,6 @@ class FusionTrainer:
         print(f"  Proposed Modules  : SAFD={getattr(self.config, 'use_safd', False)} | CAFG={getattr(self.config, 'use_cafg', False)} | TPSW={getattr(self.config, 'use_tpsw', False)}")
         print(f"  Input Resolution  : {self.config.img_height}x{self.config.img_width} | Classes={self.config.num_classes}")
         print(f"  Loss & Optimizer  : Type={self.config.loss_type} | Base WD={getattr(self.config, 'weight_decay', 0.01)}")
-
-        # Clarify legacy/dead config fields
-        legacy_fields = ['fuse_type', 'distill_type', 'fusion_strategy', 'flat_epochs']
-        for field in legacy_fields:
-            if hasattr(self.config, field):
-                val = getattr(self.config, field)
-                print(f"  [CONFIG AUDIT] Legacy field '{field}' = '{val}' (retained for CLI compatibility; overridden by FAF architecture).")
         print("=" * 80)
 
     def setup_directories(self):
@@ -1437,23 +1430,12 @@ def main():
     # Model arguments
     parser.add_argument('--rgb_model_path', type=str, default='',
                         help='Path to pretrained RGB model')
-    parser.add_argument('--ir_model_path', type=str, default='',
-                        help='Path to pretrained IR model')
-    parser.add_argument('--fusion_strategy', type=str, default='average_summation',
-                        choices=['simple', 'middle_attention','average_summation'],
-                        help='Fusion strategy')
-    parser.add_argument('--fuse_type', type=str, default='scalar',#pixel',scalar
-                        choices=['scalar', 'channel','pixel'])
-    parser.add_argument('--distill_type', type=str, default='mul',
-                        choices=['mul', 'sum'])
     parser.add_argument('--rgb_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
                         help='timm model name for RGB backbone')
     parser.add_argument('--ir_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
                         help='timm model name for IR backbone')
     parser.add_argument('--context_dim', type=str, default='[96,192,384,768]')
     parser.add_argument('--freeze_backbones', action='store_true', default = False,
-                        help='Freeze pretrained backbones')
-    parser.add_argument('--distill_layers_enabled', action='store_true', default = False,
                         help='Freeze pretrained backbones')
     parser.add_argument('--resume', action='store_true',default=False,
         help='Resume training from checkpoint')
@@ -1532,8 +1514,6 @@ def main():
                         help='Step size for step scheduler')
     parser.add_argument('--warmup_epochs', type=int, default=10,
                         help='warmup epochs for cosine_warmup scheduler')
-    parser.add_argument('--flat_epochs', type=int, default=10,
-                        help='flat epochs for cosine_warmup scheduler')
 
     # Loss arguments
     parser.add_argument('--ce_weight', type=float, default=0.4,
@@ -1626,7 +1606,7 @@ def main():
     # Set experiment name if not provided
     if args.exp_name is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.exp_name = f"fusion_{args.fusion_strategy}_{timestamp}"
+        args.exp_name = f"faf_{timestamp}"
     
     # Create trainer and start training
     trainer = FusionTrainer(args)

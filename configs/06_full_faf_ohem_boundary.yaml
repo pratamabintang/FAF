@@ -51,11 +51,7 @@ positive_aware_sampler: false           # Dataset-level WeightedRandomSampler pr
 rgb_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
 ir_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
 context_dim: "[96,192,384,768]"
-fusion_strategy: "average_summation"   # Options: "simple" | "middle_attention" | "average_summation"
-fuse_type: "scalar"                    # Options: "scalar" | "channel" | "pixel"
-distill_type: "mul"                    # Options: "mul" | "sum"
 freeze_backbones: false
-distill_layers_enabled: false
 
 # Decoder & Novel Attention Modules
 decoder_type: "panet"                  # Options: "fpn" | "panet"
@@ -85,7 +81,6 @@ clip_grad: 0.1
 # Learning Rate Scheduler
 scheduler: "cosine_warmup"             # Options: "cosine_warmup" | "cosine" | "poly" | "step" | "plateau" | "none"
 warmup_epochs: 10
-flat_epochs: 10
 t0: 50
 step_size: 45
 

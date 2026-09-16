@@ -22,11 +22,7 @@
   "rgb_arch": "convnextv2_tiny.fcmae_ft_in22k_in1k_384",
   "ir_arch": "convnextv2_tiny.fcmae_ft_in22k_in1k_384",
   "context_dim": "[96,192,384,768]",
-  "fusion_strategy": "average_summation",
-  "fuse_type": "scalar",
-  "distill_type": "mul",
   "freeze_backbones": false,
-  "distill_layers_enabled": false,
   "decoder_type": "panet",
   "deep_supervision": false,
   "enhanced_fusion": false,
@@ -41,20 +37,19 @@
   "epochs": 300,
   "batch_size": 8,
   "optimizer": "adamw",
-  "lr_backbone": 0.00003,
+  "lr_backbone": 3e-05,
   "lr_fusion": 0.0003,
   "lr_decoder": 0.0003,
   "weight_decay": 0.01,
   "clip_grad": 0.1,
   "scheduler": "cosine_warmup",
   "warmup_epochs": 10,
-  "flat_epochs": 10,
   "t0": 50,
   "step_size": 45,
   "loss_type": "combo_ohem",
   "ce_weight": 0.35,
   "dice_weight": 0.35,
-  "lovasz_weight": 0.30,
+  "lovasz_weight": 0.3,
   "label_smoothing": 0.0,
   "class_weights": true,
   "class_weight_multiplier": 10.0,
@@ -72,5 +67,7 @@
   "ema_decay": 0.999,
   "eval_use_ema": true,
   "eval_tta": false,
-  "tta_scales": [1.0]
+  "tta_scales": [
+    1.0
+  ]
 }

@@ -43,11 +43,7 @@ class FusionModel(nn.Module):
         terrain_arch: Optional[str] = None,
         pretrained = True,
         num_classes: int = 9,
-        fusion_strategy: str = "middle_attention",
         freeze_backbones: bool = False,
-        distill_layers_enabled: bool = True,
-        fuse_type: str = "scalar", # "scalar", "channel", "pixel"
-        distill_type: str = "mul", # "sum", "mul"
         context_dim: Optional[List[int]] = None,
         input_resolution: Tuple[int, int] = (480, 640),
         rgb_backbone_resolution: Tuple[int, int] = (480, 640),  # For RGB backbone
@@ -63,6 +59,7 @@ class FusionModel(nn.Module):
         ir_in_chans: int = 1,         # Input channels for IR/Terrain (1 for DTM, 4 with derivatives)
         terrain_in_chans: Optional[int] = None,
         modal_mode: str = "multimodal",  # Options: "multimodal" | "rgb_only" | "dtm_only"
+        **kwargs,
     ):
         super().__init__()
 
@@ -83,10 +80,6 @@ class FusionModel(nn.Module):
         self.ir_backbone_resolution = self.terrain_backbone_resolution = effective_terrain_resolution
         self.output_resolution = output_resolution
         self.num_classes = num_classes
-        self.distill_layers_enabled = distill_layers_enabled
-        self.fuse_type = fuse_type
-        self.distill_type = distill_type
-        self.fusion_strategy = fusion_strategy
         self.deep_supervision = deep_supervision
 
         # --- Multi-scale Backbones Selection based on modal_mode ---
