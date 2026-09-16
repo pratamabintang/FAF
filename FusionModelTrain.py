@@ -614,6 +614,9 @@ class FusionTrainer:
             include_derivatives = getattr(self.config, 'include_derivatives', False)
             pixel_scale = getattr(self.config, 'pixel_scale', 1.0)
             ignore_nodata = getattr(self.config, 'ignore_nodata', True)
+            nodata_value = getattr(self.config, 'nodata_value', -9999.0)
+            ignore_index = getattr(self.config, 'ignore_index', -100)
+            scale_crop_prob = getattr(self.config, 'scale_crop_prob', 0.5)
             positive_aware_sampling = getattr(self.config, 'positive_aware_sampling', True)
             positive_sample_prob = getattr(self.config, 'positive_sample_prob', 0.5)
 
@@ -628,6 +631,9 @@ class FusionTrainer:
                 include_derivatives=include_derivatives,
                 pixel_scale=pixel_scale,
                 ignore_nodata=ignore_nodata,
+                nodata_value=nodata_value,
+                ignore_index=ignore_index,
+                scale_crop_prob=scale_crop_prob,
                 positive_aware_sampling=positive_aware_sampling,
                 positive_sample_prob=positive_sample_prob
             )
@@ -642,7 +648,9 @@ class FusionTrainer:
                 dtm_std=dtm_std,
                 include_derivatives=include_derivatives,
                 pixel_scale=pixel_scale,
-                ignore_nodata=ignore_nodata
+                ignore_nodata=ignore_nodata,
+                nodata_value=nodata_value,
+                ignore_index=ignore_index
             )
         else:
             raise ValueError(f"Unknown dataset: {self.config.dataset}. Choose 'landslide', 'mfnet', or 'pst900'.")
@@ -707,7 +715,7 @@ class FusionTrainer:
         else:
             class_weights = None
         
-        ignore_idx = 0 if self.config.ignore_unlabeled else -100
+        ignore_idx = getattr(self.config, 'ignore_index', 0 if getattr(self.config, 'ignore_unlabeled', False) else -100)
 
         if self.config.loss_type == 'combo3':
             criterion_main = ComboLoss3(
@@ -762,6 +770,9 @@ class FusionTrainer:
         return criterion_main, criterion_aux
     
     def calculate_class_weights(self):
+        assert self.config.num_classes == 2, (
+            f"Landslide project specifically targets binary segmentation (num_classes=2), got {self.config.num_classes}"
+        )
         print("Calculating class weights directly from raw training labels (DTM validity-filtered)...")
         class_counts = torch.zeros(self.config.num_classes, device=self.device)
 
@@ -798,6 +809,11 @@ class FusionTrainer:
                 mask = mask.to(self.device)
                 valid = (mask >= 0) & (mask < self.config.num_classes) & (mask != ignore_idx)
                 class_counts += torch.bincount(mask[valid], minlength=self.config.num_classes)
+
+        if class_counts.sum() == 0:
+            raise RuntimeError("No valid training pixels found during class weight calculation")
+        if class_counts[1] == 0:
+            raise RuntimeError("No landslide foreground pixels found in training split during class weight calculation")
 
         freq = class_counts / class_counts.sum()
 
@@ -1018,7 +1034,7 @@ class FusionTrainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.config.epochs}')
         self.optimizer.zero_grad(set_to_none=True)
 
-        ignore_idx = 0 if getattr(self.config, 'ignore_unlabeled', False) else -100
+        ignore_idx = getattr(self.config, 'ignore_index', 0 if getattr(self.config, 'ignore_unlabeled', False) else -100)
 
         for batch_idx, (rgb, ir, masks,_) in enumerate(pbar):
             # Fail-fast validation on label values: allow valid class IDs or ignore_index (-100)

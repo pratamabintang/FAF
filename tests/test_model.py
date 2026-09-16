@@ -469,6 +469,13 @@ class TestModelArchitecture(unittest.TestCase):
             modal_mode='rgb_only',
             pretrained=False
         )
+        self.assertIsNotNone(model_rgb.rgb_encoder)
+        self.assertIsNone(model_rgb.ir_encoder)
+        self.assertIsNone(model_rgb.fusion_stage1)
+        self.assertIsNone(model_rgb.fusion_stage2)
+        self.assertIsNone(model_rgb.fusion_stage3)
+        self.assertIsNone(model_rgb.fusion_stage4)
+
         rgb = torch.randn(2, 3, 64, 64)
         logits_rgb, _ = model_rgb(rgb=rgb)
         self.assertEqual(logits_rgb.shape, (2, 2, 64, 64))
@@ -487,6 +494,13 @@ class TestModelArchitecture(unittest.TestCase):
             modal_mode='dtm_only',
             pretrained=False
         )
+        self.assertIsNone(model_dtm.rgb_encoder)
+        self.assertIsNotNone(model_dtm.ir_encoder)
+        self.assertIsNone(model_dtm.fusion_stage1)
+        self.assertIsNone(model_dtm.fusion_stage2)
+        self.assertIsNone(model_dtm.fusion_stage3)
+        self.assertIsNone(model_dtm.fusion_stage4)
+
         dtm = torch.randn(2, 1, 64, 64)
         logits_dtm, _ = model_dtm(terrain=dtm)
         self.assertEqual(logits_dtm.shape, (2, 2, 64, 64))
@@ -494,6 +508,68 @@ class TestModelArchitecture(unittest.TestCase):
         # Passing None for terrain should raise ValueError
         with self.assertRaises(ValueError):
             model_dtm(terrain=None)
+
+        # 3. Parameter count decoupling assertion
+        model_multi = FusionModel(
+            rgb_arch='convnextv2_nano.fcmae_ft_in22k_in1k_384',
+            ir_arch='convnextv2_nano.fcmae_ft_in22k_in1k_384',
+            num_classes=2,
+            input_resolution=(64, 64),
+            output_resolution=(64, 64),
+            modal_mode='multimodal',
+            pretrained=False
+        )
+        params_rgb = sum(p.numel() for p in model_rgb.parameters())
+        params_dtm = sum(p.numel() for p in model_dtm.parameters())
+        params_multi = sum(p.numel() for p in model_multi.parameters())
+        self.assertLess(params_rgb, params_multi)
+        self.assertLess(params_dtm, params_multi)
+
+    def test_heterogeneous_backbones_unimodal_and_multimodal(self):
+        """Verify dynamic decoder routing when RGB and DTM backbones have different context dimensions."""
+        from FusionModel import FusionModel
+
+        # RGB = Nano ([80, 160, 320, 640]), DTM = Tiny ([96, 192, 384, 768])
+        rgb_arch = 'convnextv2_nano.fcmae_ft_in22k_in1k_384'
+        ir_arch = 'convnextv2_tiny.fcmae_ft_in22k_in1k_384'
+
+        # 1. dtm_only mode with Tiny backbone must route Tiny channels [96, 192, 384, 768] to decoder
+        model_dtm_tiny = FusionModel(
+            rgb_arch=rgb_arch,
+            ir_arch=ir_arch,
+            modal_mode='dtm_only',
+            pretrained=False,
+            input_resolution=(64, 64),
+            output_resolution=(64, 64)
+        )
+        dtm = torch.randn(2, 1, 64, 64)
+        out_dtm, _ = model_dtm_tiny(terrain=dtm)
+        self.assertEqual(out_dtm.shape, (2, 2, 64, 64))
+
+        # 2. rgb_only mode with Nano backbone must route Nano channels [80, 160, 320, 640] to decoder
+        model_rgb_nano = FusionModel(
+            rgb_arch=rgb_arch,
+            ir_arch=ir_arch,
+            modal_mode='rgb_only',
+            pretrained=False,
+            input_resolution=(64, 64),
+            output_resolution=(64, 64)
+        )
+        rgb = torch.randn(2, 3, 64, 64)
+        out_rgb, _ = model_rgb_nano(rgb=rgb)
+        self.assertEqual(out_rgb.shape, (2, 2, 64, 64))
+
+        # 3. multimodal mode with heterogeneous backbones
+        model_multi_hetero = FusionModel(
+            rgb_arch=rgb_arch,
+            ir_arch=ir_arch,
+            modal_mode='multimodal',
+            pretrained=False,
+            input_resolution=(64, 64),
+            output_resolution=(64, 64)
+        )
+        out_multi, _ = model_multi_hetero(rgb=rgb, terrain=dtm)
+        self.assertEqual(out_multi.shape, (2, 2, 64, 64))
 
     def test_all_yaml_configurations_offline_smoke(self):
         """Verify all configuration YAML files instantiate, forward, and backward offline with pretrained=False."""

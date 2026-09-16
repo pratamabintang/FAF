@@ -89,48 +89,59 @@ class FusionModel(nn.Module):
         self.fusion_strategy = fusion_strategy
         self.deep_supervision = deep_supervision
 
-        # --- Context dimensions for ConvNeXt backbones ---
-        if context_dim is not None:
-            self.context_dim = context_dim
+        # --- Multi-scale Backbones Selection based on modal_mode ---
+        is_rgb_active = (self.modal_mode not in ("dtm_only", "ir_only"))
+        is_dtm_active = (self.modal_mode != "rgb_only")
+
+        if is_rgb_active:
+            self.rgb_encoder = timm.create_model(
+                rgb_arch,
+                features_only=True,
+                pretrained=pretrained,
+                in_chans=3
+            )
+            self.rgb_channels = self.rgb_encoder.feature_info.channels()
         else:
-            self.context_dim = get_backbone_context_dim(rgb_arch)
+            self.rgb_encoder = None
+            self.rgb_channels = None
 
-        # --- Multi-scale Backbones ---
-        self.rgb_encoder = timm.create_model(
-            rgb_arch,
-            features_only=True,
-            pretrained=pretrained,
-            in_chans=3
-        )
-        self.ir_encoder = timm.create_model(
-            effective_terrain_arch,
-            features_only=True,
-            pretrained=pretrained,
-            in_chans=effective_terrain_in_chans,
-        )
+        if is_dtm_active:
+            self.ir_encoder = timm.create_model(
+                effective_terrain_arch,
+                features_only=True,
+                pretrained=pretrained,
+                in_chans=effective_terrain_in_chans,
+            )
+            self.ir_channels = self.ir_encoder.feature_info.channels()
+        else:
+            self.ir_encoder = None
+            self.ir_channels = None
 
-        # Learn channel configuration directly from encoders
-        self.rgb_channels = self.rgb_encoder.feature_info.channels()
-        self.ir_channels = self.ir_encoder.feature_info.channels()
+        # Determine active feature channels feeding into the decoder
+        if self.modal_mode in ("dtm_only", "ir_only"):
+            active_decoder_channels = self.ir_channels
+            arch_for_context = effective_terrain_arch
+        else:
+            active_decoder_channels = self.rgb_channels
+            arch_for_context = rgb_arch
 
-        # Validate and synchronize context_dim with backbone channels
-        # Standard configs: Nano=[80,160,320,640], Tiny=[96,192,384,768], Base=[128,256,512,1024]
+        # --- Context dimensions for decoder ---
         if context_dim is None:
-            context_dim = self.rgb_channels
+            context_dim = active_decoder_channels
         elif isinstance(context_dim, str):
             context_dim = [int(x.strip()) for x in context_dim.strip('[]').split(',')]
         else:
             context_dim = list(context_dim)
 
-        if list(context_dim) != list(self.rgb_channels):
-            print(f"[FusionModel NOTE] Adjusted context_dim {context_dim} -> {self.rgb_channels} to match backbone {rgb_arch}")
-            context_dim = self.rgb_channels
+        if list(context_dim) != list(active_decoder_channels):
+            print(f"[FusionModel NOTE] Adjusted context_dim {context_dim} -> {active_decoder_channels} to match active backbone {arch_for_context}")
+            context_dim = active_decoder_channels
 
-        self.context_dims = context_dim
+        self.context_dims = self.context_dim = context_dim
 
         # ---- Decoder Selection ----
         if decoder_type == "panet":
-            print(f"[FusionModel] Using PANet decoder with deep_supervision={deep_supervision}")
+            print(f"[FusionModel] Using PANet decoder with deep_supervision={deep_supervision} (in_channels={context_dim})")
             self.decoder = PANetDecoder(
                 in_channels=context_dim,
                 num_classes=num_classes,
@@ -138,7 +149,7 @@ class FusionModel(nn.Module):
                 deep_supervision=deep_supervision
             )
         else:
-            print(f"[FusionModel] Using standard FPN decoder")
+            print(f"[FusionModel] Using standard FPN decoder (in_channels={context_dim})")
             self.decoder = FusionAwareNativeResolutionDecoder(
                 in_channels=context_dim,
                 num_classes=num_classes,
@@ -146,62 +157,62 @@ class FusionModel(nn.Module):
             )
 
         print(f"Fusion Model Configuration:")
+        print(f"  Mode: {self.modal_mode.upper()}")
         print(f"  Input Resolution: {input_resolution} (HxW)")
-        print(f"  RGB Backbone Resolution: {rgb_backbone_resolution}")
-        print(f"  IR Backbone Resolution: {ir_backbone_resolution}")
+        print(f"  RGB Backbone Resolution: {rgb_backbone_resolution if is_rgb_active else 'N/A'}")
+        print(f"  IR Backbone Resolution: {ir_backbone_resolution if is_dtm_active else 'N/A'}")
         print(f"  Output Resolution: {output_resolution} (HxW)")
         print(f"  Number of Classes: {num_classes}")
-        print(f"  Context Dimensions: {context_dim}")
-        
-        print(f"RGB Backbone Channels: {self.rgb_channels}")
-        print(f"IR Backbone Channels:  {self.ir_channels}")
+        print(f"  Decoder Input Channels: {context_dim}")
 
-        num_of_params = sum(
-            p.numel() for p in self.rgb_encoder.parameters()
-        ) / 1e6
-        print(f"Number of parameters for rgb encoder {rgb_arch}: {num_of_params:.2f} M")
-
-        num_of_params = sum(
-            p.numel() for p in self.ir_encoder.parameters()
-        ) / 1e6
-        print(f"Number of parameters for ir encoder {ir_arch}: {num_of_params:.2f} M")
+        if is_rgb_active:
+            print(f"RGB Backbone Channels: {self.rgb_channels}")
+            num_of_params = sum(p.numel() for p in self.rgb_encoder.parameters()) / 1e6
+            print(f"Number of parameters for rgb encoder {rgb_arch}: {num_of_params:.2f} M")
+        if is_dtm_active:
+            print(f"IR Backbone Channels:  {self.ir_channels}")
+            num_of_params = sum(p.numel() for p in self.ir_encoder.parameters()) / 1e6
+            print(f"Number of parameters for ir encoder {effective_terrain_arch}: {num_of_params:.2f} M")
 
         # --- Terrain Prior Module (raw DTM/Terrain -> spatial prior) ---
-        if use_tpsw:
+        if is_dtm_active and use_tpsw:
             print(f"[FusionModel] [3] Topographic Prior-Guided Spatial Weighting (TPSW) ENABLED")
             self.terrain_prior = self.thermal_prior = TerrainPriorModule(in_channels=effective_terrain_in_chans)
-
-        # --- Fusion Stages ---
-        # Stage 1-2: Frequency-aware fusion (low-level details)
-        if use_safd or use_cafg:
-            print(f"[FusionModel] Novel fusion (Stage 1-2): SAFD={use_safd}, CAFG={use_cafg}")
-            self.fusion_stage1 = NovelFrequencyAwareFusionModule(
-                rgb_c=self.rgb_channels[0], ir_c=self.ir_channels[0],
-                use_safd=use_safd, use_cafg=use_cafg
-            )
-            self.fusion_stage2 = NovelFrequencyAwareFusionModule(
-                rgb_c=self.rgb_channels[1], ir_c=self.ir_channels[1],
-                use_safd=use_safd, use_cafg=use_cafg
-            )
         else:
-            self.fusion_stage1 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[0], ir_c=self.ir_channels[0])
-            self.fusion_stage2 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[1], ir_c=self.ir_channels[1])
+            self.terrain_prior = self.thermal_prior = None
 
-        # Stage 3-4: Semantic fusion (high-level semantics)
-        if use_cafg:
-            print(f"[FusionModel] Novel fusion (Stage 3-4): CAFG=True")
-            self.fusion_stage3 = NovelSemanticFusionModule(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
-            self.fusion_stage4 = NovelSemanticFusionModule(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
-        elif enhanced_fusion:
-            print(f"[FusionModel] Using EnhancedSemanticFusion for stages 3-4")
-            self.fusion_stage3 = EnhancedSemanticFusion(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
-            self.fusion_stage4 = EnhancedSemanticFusion(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
+        # --- Fusion Stages (only needed in multimodal mode) ---
+        if self.modal_mode == "multimodal":
+            # Stage 1-2: Frequency-aware fusion (low-level details)
+            if use_safd or use_cafg:
+                print(f"[FusionModel] Novel fusion (Stage 1-2): SAFD={use_safd}, CAFG={use_cafg}")
+                self.fusion_stage1 = NovelFrequencyAwareFusionModule(
+                    rgb_c=self.rgb_channels[0], ir_c=self.ir_channels[0],
+                    use_safd=use_safd, use_cafg=use_cafg
+                )
+                self.fusion_stage2 = NovelFrequencyAwareFusionModule(
+                    rgb_c=self.rgb_channels[1], ir_c=self.ir_channels[1],
+                    use_safd=use_safd, use_cafg=use_cafg
+                )
+            else:
+                self.fusion_stage1 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[0], ir_c=self.ir_channels[0])
+                self.fusion_stage2 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[1], ir_c=self.ir_channels[1])
+
+            # Stage 3-4: Semantic fusion (high-level semantics)
+            if use_cafg:
+                print(f"[FusionModel] Novel fusion (Stage 3-4): CAFG=True")
+                self.fusion_stage3 = NovelSemanticFusionModule(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
+                self.fusion_stage4 = NovelSemanticFusionModule(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
+            elif enhanced_fusion:
+                print(f"[FusionModel] Using EnhancedSemanticFusion for stages 3-4")
+                self.fusion_stage3 = EnhancedSemanticFusion(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
+                self.fusion_stage4 = EnhancedSemanticFusion(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
+            else:
+                print(f"[FusionModel] Using FrequencyAwareFusionModule for stages 3-4")
+                self.fusion_stage3 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
+                self.fusion_stage4 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
         else:
-            print(f"[FusionModel] Using FrequencyAwareFusionModule for stages 3-4")
-            #self.fusion_stage3 = SemanticCrossGatedFusion(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
-            #self.fusion_stage4 = SemanticCrossGatedFusion(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
-            self.fusion_stage3 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[2], ir_c=self.ir_channels[2])
-            self.fusion_stage4 = FrequencyAwareFusionModule(rgb_c=self.rgb_channels[3], ir_c=self.ir_channels[3])
+            self.fusion_stage1 = self.fusion_stage2 = self.fusion_stage3 = self.fusion_stage4 = None
   
 
     @staticmethod
@@ -219,6 +230,11 @@ class FusionModel(nn.Module):
 
         
     def forward(self, rgb=None, ir=None, terrain=None):
+        # Support single positional argument for unimodal DTM/IR mode
+        if self.modal_mode in ("dtm_only", "ir_only") and terrain is None and ir is None and rgb is not None:
+            terrain = rgb
+            rgb = None
+
         if terrain is None:
             terrain = ir
 
@@ -708,6 +724,8 @@ class ComplementarityAwareFusionGate(nn.Module):
         d_cos(f_rgb, f_terrain) = 1.0 - <normalize(W_p f_rgb), normalize(W_p f_terrain)> in [0, 1]
       
     Scientific Domain Mechanics (Cross-Modal Disagreement Gating):
+      CAFG uses learned cross-modal disagreement as a dynamic routing signal, which may capture
+      either complementary or conflicting evidentiary signals across optical and terrain modalities:
       - Low Disagreement / Agreement (d_cos -> 0): Both optical spectral cues (e.g. bare ground texture)
         and terrain morphometrics (e.g. steep slope scarp) concordantly identify identical surface structures.
         Linear residual summation (f_rgb + f_terrain) suffices without heavy cross-attention compute.
@@ -766,16 +784,17 @@ class ComplementarityAwareFusionGate(nn.Module):
 # ==========================================
 class TerrainPriorModule(nn.Module):
     """
-    Extracts physics-informed topographic prior features directly from raw DTM/terrain input (pre-backbone).
+    Terrain-Conditioned Spatial Weighting (TPSW):
+    Extracts learned spatial susceptibility attention conditioned directly on the raw DTM/terrain raster (pre-backbone).
     
     Landslide Domain Formulation:
     Topographic discontinuities, sudden slope breaks, scarp edges, and curvature anomalies 
     strongly correlate with landslide initiation zones and slip surfaces.
-    This module uses the input elevation/terrain raster to generate multi-scale spatial priors
+    This module encodes raw terrain morphometry to generate multi-scale spatial attention priors
     to modulate fused cross-modal features across the network pyramid.
 
     Bidirectional Modulation (Centered Prior Formulation):
-    The raw prior map tp in [0, 1] is applied to pyramid features via f * (0.5 + tp):
+    The learned prior map tp in [0, 1] is applied to pyramid features via f * (0.5 + tp):
       - Low prior (tp -> 0, e.g. flat plain/valley): multiplier = 0.5 (suppression of false alarms)
       - Neutral prior (tp = 0.5, gentle terrain): multiplier = 1.0 (identity / neutral)
       - High prior (tp -> 1, steep scarps/shear zones): multiplier = 1.5 (amplification of landslide cues)

@@ -257,10 +257,14 @@ def main():
                 cfg = yaml.safe_load(f)
             include_derivs = cfg.get("include_derivatives", False)
             ir_chans = 4 if include_derivs else cfg.get("ir_in_chans", 1)
+            resolved_rgb_arch = args.arch or cfg.get("rgb_arch") or cfg.get("rgb_backbone") or default_arch
+            resolved_ir_arch = args.arch or cfg.get("ir_arch") or cfg.get("ir_backbone") or default_arch
+            print(f"[CONFIG DISCOVERY] Config '{yp.name}': Resolved RGB arch='{resolved_rgb_arch}', Resolved terrain arch='{resolved_ir_arch}'")
+
             test_matrix.append({
                 "model_name": f"Config [{yp.name}]: {cfg.get('exp_name', yp.stem)}",
-                "rgb_arch": args.arch or cfg.get("rgb_backbone", default_arch),
-                "ir_arch": args.arch or cfg.get("ir_backbone", default_arch),
+                "rgb_arch": resolved_rgb_arch,
+                "ir_arch": resolved_ir_arch,
                 "decoder_type": cfg.get("decoder_type", "fpn"),
                 "use_safd": cfg.get("use_safd", False),
                 "use_cafg": cfg.get("use_cafg", False),

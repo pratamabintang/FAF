@@ -422,6 +422,9 @@ class TestLandslideDataset(unittest.TestCase):
             self.assertTrue(res["passed"])
             self.assertEqual(len(res["dimension_mismatches"]), 0)
             self.assertEqual(len(res["corrupted_files"]), 0)
+            self.assertEqual(len(res["georeferencing_mismatches"]), 0)
+            self.assertIn("rasterio_available", res)
+
     def test_class_weights_excludes_nodata(self):
         """Verify that calculate_class_weights filters out DTM NoData pixels."""
         from FusionModelTrain import FusionTrainer
@@ -468,6 +471,55 @@ class TestLandslideDataset(unittest.TestCase):
             self.assertFalse(torch.isnan(weights).any())
             self.assertEqual(weights[0].item(), 1.0)
             self.assertGreater(weights[1].item(), 1.0)
+
+    def test_class_weights_fail_fast_guards(self):
+        """Verify fail-fast assertions in calculate_class_weights for invalid configurations or zero landslides."""
+        from FusionModelTrain import FusionTrainer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            train_dir = Path(tmpdir) / "train"
+            for sub in ["IMAGE", "DTM", "LABEL"]:
+                (train_dir / sub).mkdir(parents=True)
+
+            img = np.zeros((10, 10, 3), dtype=np.uint8)
+            dtm = np.ones((10, 10), dtype=np.float32) * 50.0
+            mask_no_landslides = np.zeros((10, 10), dtype=np.uint8)
+
+            cv2.imwrite(str(train_dir / "IMAGE" / "tile_001.png"), img)
+            cv2.imwrite(str(train_dir / "DTM" / "tile_001.tif"), dtm)
+            cv2.imwrite(str(train_dir / "LABEL" / "tile_001.png"), mask_no_landslides)
+
+            dataset = LandslideDataset(
+                data_dir=tmpdir,
+                split="train",
+                img_size=(10, 10),
+                is_training=False
+            )
+
+            class DummyConfig:
+                num_classes = 2
+                class_weight_multiplier = 10.0
+                dataset = "landslide"
+
+            class DummyTrainer:
+                def __init__(self, ds, num_classes=2):
+                    self.config = DummyConfig()
+                    self.config.num_classes = num_classes
+                    self.device = torch.device("cpu")
+                    self.train_loader = type("Loader", (), {"dataset": ds})()
+
+            DummyTrainer.calculate_class_weights = FusionTrainer.calculate_class_weights
+
+            # 1. Zero positive landslide pixels must raise RuntimeError
+            trainer_zero_pos = DummyTrainer(dataset, num_classes=2)
+            with self.assertRaises(RuntimeError) as ctx:
+                trainer_zero_pos.calculate_class_weights()
+            self.assertIn("No landslide foreground pixels found", str(ctx.exception))
+
+            # 2. Unsupported num_classes != 2 must assert or raise
+            trainer_multi = DummyTrainer(dataset, num_classes=3)
+            with self.assertRaises(AssertionError):
+                trainer_multi.calculate_class_weights()
 
     def test_topographic_normalization_local_relief_and_slope_only(self):
         """Verify relative local relief and slope-only terrain normalization."""
