@@ -2,8 +2,17 @@ import os, argparse, time, datetime, sys, shutil, stat, torch
 import numpy as np 
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
-from FusionModelDataset import FusionModelDataset
-from PST900Dataset import PST900Dataset, get_pst900_palette
+try:
+    from FusionModelDataset import FusionModelDataset
+except ImportError:
+    FusionModelDataset = None
+
+try:
+    from PST900Dataset import PST900Dataset, get_pst900_palette
+except ImportError:
+    PST900Dataset = None
+    get_pst900_palette = None
+
 from LandslideDataset import LandslideDataset
 from FusionModelUtils import compute_results, get_palette, visualize
 from sklearn.metrics import confusion_matrix
@@ -13,58 +22,74 @@ from FusionModel import FusionModel, get_backbone_context_dim
 from FusionModelTrain import ModelEMA
 from tent import Tent, collect_params, configure_model
 
-#############################################################################################
-parser = argparse.ArgumentParser(description='Test with pytorch')
-#############################################################################################
-parser.add_argument('--model_name', '-m', type=str, default='FusionModel')
-parser.add_argument('--weight_name', '-w', type=str, default='checkpoints')
-parser.add_argument('--file_name', '-f', type=str, default='best_model.ema.pth')
-parser.add_argument('--dataset_split', '-d', type=str, default='test') # test, val, test_day, test_night
-parser.add_argument('--have_test_labels', '-htl', type=bool, default=True) 
-parser.add_argument('--gpu', '-g', type=int, default=0)
-#############################################################################################
-parser.add_argument('--img_height', '-ih', type=int, default=512) 
-parser.add_argument('--img_width', '-iw', type=int, default=512)  
-parser.add_argument('--num_workers', '-j', type=int, default=4)
-parser.add_argument('--n_class', '-nc', type=int, default=2)
-parser.add_argument('--context_dim', type=str, default='[96,192,384,768]')
-parser.add_argument('--dataset', type=str, default='landslide', choices=['landslide', 'mfnet', 'pst900'],
-                    help='Dataset to evaluate: landslide (2 classes), mfnet (9 classes) or pst900 (5 classes)')
-parser.add_argument('--data_dir', '-dr', type=str, default='./dataset/dataset_1')
-parser.add_argument('--model_dir', '-wd', type=str, default='Experiments/faf_landslide_experiment_v1')
-parser.add_argument('--visualize', action='store_true', default=True, help='Save prediction masks and side-by-side diagnostic panels')
-#############################################################################################
-# ---- TTA argümanları ----
-parser.add_argument('--tta', action='store_true', default=False,
-                    help='Enable test-time augmentation')
-parser.add_argument('--tta_scales', type=float, nargs='+', default=[1.0],
-                    help='TTA scales, e.g. 0.75 1.0 1.25')
-parser.add_argument('--tta_flip', action='store_true', default=False,
-                    help='Add horizontal flip to TTA')
+# Explicit model class registry (P0: replace unsafe eval())
+MODELS = {
+    "FusionModel": FusionModel,
+}
 
-# ---- TENT argümanları ----
-parser.add_argument('--use_tent', action='store_true', default=False, help='Enable TENT test-time adaptation')
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Test with pytorch')
+    parser.add_argument('--model_name', '-m', type=str, default='FusionModel')
+    parser.add_argument('--weight_name', '-w', type=str, default='checkpoints')
+    parser.add_argument('--file_name', '-f', type=str, default='best_model.ema.pth')
+    parser.add_argument('--dataset_split', '-d', type=str, default='test') # test, val, test_day, test_night
+    parser.add_argument('--have-test-labels', '--have_test_labels', '-htl',
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help='Whether ground truth test labels are available for quantitative evaluation')
+    parser.add_argument('--gpu', '-g', type=int, default=0)
+    parser.add_argument('--img_height', '-ih', type=int, default=512) 
+    parser.add_argument('--img_width', '-iw', type=int, default=512)  
+    parser.add_argument('--num_workers', '-j', type=int, default=4)
+    parser.add_argument('--n_class', '-nc', type=int, default=2)
+    parser.add_argument('--context_dim', type=str, default='[96,192,384,768]')
+    parser.add_argument('--dataset', type=str, default='landslide', choices=['landslide', 'mfnet', 'pst900'],
+                        help='Dataset to evaluate: landslide (2 classes), mfnet (9 classes) or pst900 (5 classes)')
+    parser.add_argument('--data_dir', '-dr', type=str, default='./dataset/dataset_1')
+    parser.add_argument('--model_dir', '-wd', type=str, default='Experiments/faf_landslide_experiment_v1')
+    parser.add_argument('--visualize',
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help='Save prediction masks and side-by-side diagnostic panels')
+    # ---- DTM Preprocessing Overrides (defaults recovered dynamically from checkpoint) ----
+    parser.add_argument('--dtm_norm', type=str, default=None, choices=['standard', 'minmax', 'local_relief', 'relative', 'slope_only', 'none'],
+                        help='DTM elevation normalization method (defaults to checkpoint config)')
+    parser.add_argument('--dtm_mean', type=float, default=None,
+                        help='Empirical mean elevation for DTM standardization (defaults to checkpoint config)')
+    parser.add_argument('--dtm_std', type=float, default=None,
+                        help='Empirical std elevation for DTM standardization (defaults to checkpoint config)')
+    parser.add_argument('--nodata_value', type=float, default=None,
+                        help='Sentinel value for NoData in DTM rasters (defaults to checkpoint config)')
+    parser.add_argument('--ignore_index', type=int, default=None,
+                        help='Target mask label index to ignore during evaluation (defaults to checkpoint config)')
+    parser.add_argument('--modal_mode', type=str, default=None, choices=['multimodal', 'rgb_only', 'dtm_only'],
+                        help='Modality operating mode (defaults to checkpoint config: multimodal, rgb_only, dtm_only)')
+    # ---- TTA argümanları ----
+    parser.add_argument('--tta', action='store_true', default=False,
+                        help='Enable test-time augmentation')
+    parser.add_argument('--tta_scales', type=float, nargs='+', default=[1.0],
+                        help='TTA scales, e.g. 0.75 1.0 1.25')
+    parser.add_argument('--tta_flip', action='store_true', default=False,
+                        help='Add horizontal flip to TTA')
+    # ---- TENT argümanları ----
+    parser.add_argument('--use_tent', action='store_true', default=False, help='Enable TENT test-time adaptation')
+    # ---- Decoder/Fusion architecture ----
+    parser.add_argument('--rgb_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+                        help='timm model name for RGB backbone')
+    parser.add_argument('--ir_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+                        help='timm model name for IR backbone')
+    parser.add_argument('--decoder_type', type=str, default='panet', choices=['fpn', 'panet'],
+                        help='Decoder type: fpn or panet')
+    parser.add_argument('--deep_supervision', action='store_true', default=False,
+                        help='Enable deep supervision for PANet decoder')
+    parser.add_argument('--enhanced_fusion', action='store_true', default=False,
+                        help='Use EnhancedSemanticFusion for stages 3-4')
+    parser.add_argument('--use_safd', action='store_true', default=False,
+                        help='Novel: Scene-Adaptive Frequency Decomposition')
+    parser.add_argument('--use_cafg', action='store_true', default=False,
+                        help='Novel: Complementarity-Aware Fusion Gate')
+    parser.add_argument('--use_tpsw', action='store_true', default=False,
+                        help='Novel: Thermal Prior-Guided Spatial Weighting')
+    return parser
 
-# ---- Decoder/Fusion architecture ----
-parser.add_argument('--rgb_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
-                    help='timm model name for RGB backbone')
-parser.add_argument('--ir_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
-                    help='timm model name for IR backbone')
-parser.add_argument('--decoder_type', type=str, default='panet', choices=['fpn', 'panet'],
-                    help='Decoder type: fpn or panet')
-parser.add_argument('--deep_supervision', action='store_true', default=False,
-                    help='Enable deep supervision for PANet decoder')
-parser.add_argument('--enhanced_fusion', action='store_true', default=False,
-                    help='Use EnhancedSemanticFusion for stages 3-4')
-parser.add_argument('--use_safd', action='store_true', default=False,
-                    help='Novel: Scene-Adaptive Frequency Decomposition')
-parser.add_argument('--use_cafg', action='store_true', default=False,
-                    help='Novel: Complementarity-Aware Fusion Gate')
-parser.add_argument('--use_tpsw', action='store_true', default=False,
-                    help='Novel: Thermal Prior-Guided Spatial Weighting')
-
-args = parser.parse_args()
-#############################################################################################
 
 def tta_inference(model, rgb, ir, scales=[1.0], do_flip=False, output_size=(480, 640)):
     """
@@ -114,7 +139,10 @@ def tta_inference(model, rgb, ir, scales=[1.0], do_flip=False, output_size=(480,
     return final_prob
 
 
-if __name__ == '__main__':
+def main(args=None):
+    if args is None:
+        parser = build_parser()
+        args = parser.parse_args()
   
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
@@ -179,6 +207,16 @@ if __name__ == '__main__':
     resolution = (img_h, img_w)
     dataset_type = ckpt_config.get("dataset", args.dataset)
 
+    # Dynamic DTM preprocessing and NoData extraction from checkpoint configuration
+    dtm_norm = args.dtm_norm if args.dtm_norm is not None else ckpt_config.get("dtm_norm", "standard")
+    dtm_mean = args.dtm_mean if args.dtm_mean is not None else ckpt_config.get("dtm_mean", 72.82)
+    dtm_std = args.dtm_std if args.dtm_std is not None else ckpt_config.get("dtm_std", 58.01)
+    nodata_value = args.nodata_value if args.nodata_value is not None else ckpt_config.get("nodata_value", -9999.0)
+    ignore_index = args.ignore_index if args.ignore_index is not None else ckpt_config.get("ignore_index", -100)
+    ignore_nodata = ckpt_config.get("ignore_nodata", True)
+    pixel_scale = ckpt_config.get("pixel_scale", 1.0)
+    modal_mode = getattr(args, "modal_mode", None) or ckpt_config.get("modal_mode", "multimodal")
+
     # Synchronize args with checkpoint configuration
     args.n_class = num_classes
     args.dataset = dataset_type
@@ -187,11 +225,17 @@ if __name__ == '__main__':
 
     print(f"[CONFIG] Instantiating {args.model_name} from checkpoint configuration:")
     print(f"  rgb_arch: {rgb_arch} | ir_arch: {ir_arch} | ir_in_chans: {ir_in_chans}")
-    print(f"  decoder_type: {decoder_type} | deep_supervision: {deep_supervision}")
+    print(f"  decoder_type: {decoder_type} | deep_supervision: {deep_supervision} | modal_mode: {modal_mode}")
     print(f"  novel_fusion: SAFD={use_safd}, CAFG={use_cafg}, TPSW={use_tpsw}")
     print(f"  resolution: {resolution} | num_classes: {num_classes} | dataset: {dataset_type}")
+    print(f"  dtm_norm: {dtm_norm} (mean={dtm_mean}, std={dtm_std}) | pixel_scale={pixel_scale}")
+    print(f"  nodata: value={nodata_value}, ignore_index={ignore_index}, ignore_nodata={ignore_nodata}")
 
-    model = eval(args.model_name)(
+    if args.model_name not in MODELS:
+        raise ValueError(
+            f"Unknown model_name '{args.model_name}'. Available models in registry: {list(MODELS.keys())}"
+        )
+    model = MODELS[args.model_name](
         rgb_arch=rgb_arch,
         ir_arch=ir_arch,
         num_classes=num_classes,
@@ -206,7 +250,8 @@ if __name__ == '__main__':
         use_safd=use_safd,
         use_cafg=use_cafg,
         use_tpsw=use_tpsw,
-        ir_in_chans=ir_in_chans
+        ir_in_chans=ir_in_chans,
+        modal_mode=modal_mode
     ).to(device)
 
     # Extract state dict and strip DataParallel 'module.' prefix if present
@@ -248,12 +293,19 @@ if __name__ == '__main__':
             split=args.dataset_split,
             img_size=resolution,
             is_training=False,
+            dtm_norm=dtm_norm,
+            dtm_mean=dtm_mean,
+            dtm_std=dtm_std,
             include_derivatives=include_derivatives,
-            pixel_scale=ckpt_config.get("pixel_scale", 1.0),
-            ignore_nodata=ckpt_config.get("ignore_nodata", True),
+            pixel_scale=pixel_scale,
+            nodata_value=nodata_value,
+            ignore_nodata=ignore_nodata,
+            ignore_index=ignore_index,
             require_labels=args.have_test_labels
         )
     elif args.dataset == 'pst900':
+        if PST900Dataset is None:
+            raise ImportError("PST900Dataset requires 'albumentations' which is not installed.")
         print(f"[INFO] Loading PST900 dataset ({args.n_class} classes)")
         test_dataset = PST900Dataset(
             data_dir=args.data_dir,
@@ -264,6 +316,8 @@ if __name__ == '__main__':
             use_augmentation=False
         )
     elif args.dataset == 'mfnet':
+        if FusionModelDataset is None:
+            raise ImportError("FusionModelDataset requires 'albumentations' which is not installed.")
         print(f"[INFO] Loading MFNet dataset ({args.n_class} classes)")
         test_dataset = FusionModelDataset(
             data_dir=args.data_dir,
@@ -310,10 +364,11 @@ if __name__ == '__main__':
     if not args.use_tent:
         model.eval()
 
-    for it, (rgb, ir, labels, img_name) in enumerate(test_loader):
+    for it, batch_data in enumerate(test_loader):
+        rgb, ir, raw_labels, img_name = batch_data
         rgb = rgb.to(device)
         ir = ir.to(device)
-        labels = labels.to(device)
+        labels = raw_labels.to(device) if args.have_test_labels else None
         
         t0 = time.perf_counter()
         if use_cuda_events:
@@ -345,10 +400,18 @@ if __name__ == '__main__':
             ave_time_cost += curr_time
             timed_frames += 1
 
-        label = labels.cpu().numpy().squeeze().flatten()
-        prediction = logits.argmax(1).cpu().numpy().squeeze().flatten()
-        conf = confusion_matrix(y_true=label, y_pred=prediction, labels=list(range(num_classes)))
-        conf_total += conf
+        # Only accumulate confusion matrix if real ground-truth labels are present
+        if args.have_test_labels and labels is not None:
+            lbl_flat = labels.cpu().numpy().squeeze().flatten()
+            pred_flat = logits.argmax(1).cpu().numpy().squeeze().flatten()
+            valid_mask = (lbl_flat != ignore_index) & (lbl_flat >= 0) & (lbl_flat < num_classes)
+            if np.any(valid_mask):
+                conf = confusion_matrix(
+                    y_true=lbl_flat[valid_mask],
+                    y_pred=pred_flat[valid_mask],
+                    labels=list(range(num_classes))
+                )
+                conf_total += conf
         
         if args.visualize:
             sample_name = img_name[0] if isinstance(img_name, (list, tuple)) else str(img_name)
@@ -361,56 +424,78 @@ if __name__ == '__main__':
                 labels=labels,
                 dataset=args.dataset,
                 save_dir=save_demo_dir,
-                save_side_by_side=True
+                save_side_by_side=True,
+                ignore_index=ignore_index
             )
-        print("%s, %s, frame %d/%d, %s, time cost: %.2f ms, demo result processed."
-              % (args.model_name, args.weight_name, it+1, len(test_loader), str(it), curr_time))
-
-    precision_per_class, recall_per_class, iou_per_class, f1score = compute_results(conf_total)
-    conf_total_matfile = os.path.join(save_demo_dir, 'conf_' + args.weight_name + '.mat')
-    savemat(conf_total_matfile, {'conf': conf_total})
-
-    if dataset_type == 'landslide' or num_classes == 2:
-        class_names = ["Background", "Landslide"]
-    elif dataset_type == 'pst900' or num_classes == 5:
-        class_names = ["Background", "Fire Extinguisher", "Backpack", "Hand Drill", "Rescue Randy"]
-    elif dataset_type == 'mfnet' or num_classes == 9:
-        class_names = ["Unlabeled", "Car", "Person", "Bike", "Curve", "Car Stop", "Guardrail", "Color Cone", "Bump"]
-    else:
-        class_names = [f"Class_{i}" for i in range(num_classes)]
-
-    device_name = torch.cuda.get_device_name(args.gpu) if torch.cuda.is_available() else 'CPU'
-    print('\n###########################################################################')
-    print('\n%s: %s test results (with batch size %d) on %s using %s:' % (args.model_name, args.weight_name, batch_size, datetime.date.today(), device_name)) 
-    print('\n* Tested dataset: %s (split: %s)' % (dataset_type, args.dataset_split))
-    print('* Tested image count: %d' % len(test_loader))
-    print('* Tested image size: %d x %d' % (img_h, img_w)) 
-    print('* Weight dir: %s' % args.weight_name) 
-    print('* Checkpoint file: %s' % args.file_name)
-
-    print('\n* Per-class Recall:')
-    for i in range(num_classes):
-        cname = class_names[i] if i < len(class_names) else f"Class_{i}"
-        print(f'    [{i}] {cname:<18}: {recall_per_class[i]:.6f}')
-
-    print('\n* Per-class IoU:')
-    for i in range(num_classes):
-        cname = class_names[i] if i < len(class_names) else f"Class_{i}"
-        print(f'    [{i}] {cname:<18}: {iou_per_class[i]:.6f}')
-
-    print('\n* Per-class F1-score:')
-    for i in range(num_classes):
-        cname = class_names[i] if i < len(class_names) else f"Class_{i}"
-        print(f'    [{i}] {cname:<18}: {f1score[i]:.6f}')
-
-    print("\n* Mean metrics across all classes:")
-    print("  Recall: %.6f | IoU (mIoU): %.6f | Precision: %.6f | F1-score: %.6f"
-          % (recall_per_class.mean(), iou_per_class.mean(), precision_per_class.mean(), f1score.mean()))
-
-    if dataset_type == 'landslide' or num_classes == 2:
-        print(f"\n* [PRIMARY METRIC] Landslide (Class 1) IoU: {iou_per_class[1]:.4f} | F1-Score: {f1score[1]:.4f}")
+        mode_str = "eval" if args.have_test_labels else "predict"
+        print("%s, %s, frame %d/%d, %s, mode: %s, time cost: %.2f ms, demo result processed."
+              % (args.model_name, args.weight_name, it+1, len(test_loader), str(it), mode_str, curr_time))
 
     mean_time_ms = ave_time_cost / max(timed_frames, 1)
     fps = (1000.0 / mean_time_ms) if mean_time_ms > 0 else 0.0
-    print(f'\n* Average time cost per frame: {mean_time_ms:.2f} ms (over {timed_frames} timed frames) -> {fps:.2f} FPS')
-    print('###########################################################################')
+
+    if args.have_test_labels:
+        precision_per_class, recall_per_class, iou_per_class, f1score = compute_results(conf_total)
+        conf_total_matfile = os.path.join(save_demo_dir, 'conf_' + args.weight_name + '.mat')
+        savemat(conf_total_matfile, {'conf': conf_total})
+
+        if dataset_type == 'landslide' or num_classes == 2:
+            class_names = ["Background", "Landslide"]
+        elif dataset_type == 'pst900' or num_classes == 5:
+            class_names = ["Background", "Fire Extinguisher", "Backpack", "Hand Drill", "Rescue Randy"]
+        elif dataset_type == 'mfnet' or num_classes == 9:
+            class_names = ["Unlabeled", "Car", "Person", "Bike", "Curve", "Car Stop", "Guardrail", "Color Cone", "Bump"]
+        else:
+            class_names = [f"Class_{i}" for i in range(num_classes)]
+
+        device_name = torch.cuda.get_device_name(args.gpu) if torch.cuda.is_available() else 'CPU'
+        print('\n###########################################################################')
+        print('\n%s: %s test results (with batch size %d) on %s using %s:' % (args.model_name, args.weight_name, batch_size, datetime.date.today(), device_name)) 
+        print('\n* Tested dataset: %s (split: %s)' % (dataset_type, args.dataset_split))
+        print('* Tested image count: %d' % len(test_loader))
+        print('* Tested image size: %d x %d' % (img_h, img_w)) 
+        print('* Weight dir: %s' % args.weight_name) 
+        print('* Checkpoint file: %s' % args.file_name)
+
+        print('\n* Per-class Recall:')
+        for i in range(num_classes):
+            cname = class_names[i] if i < len(class_names) else f"Class_{i}"
+            print(f'    [{i}] {cname:<18}: {recall_per_class[i]:.6f}')
+
+        print('\n* Per-class IoU:')
+        for i in range(num_classes):
+            cname = class_names[i] if i < len(class_names) else f"Class_{i}"
+            print(f'    [{i}] {cname:<18}: {iou_per_class[i]:.6f}')
+
+        print('\n* Per-class F1-score:')
+        for i in range(num_classes):
+            cname = class_names[i] if i < len(class_names) else f"Class_{i}"
+            print(f'    [{i}] {cname:<18}: {f1score[i]:.6f}')
+
+        print("\n* Mean metrics across all classes:")
+        print("  Recall: %.6f | IoU (mIoU): %.6f | Precision: %.6f | F1-score: %.6f"
+              % (recall_per_class.mean(), iou_per_class.mean(), precision_per_class.mean(), f1score.mean()))
+
+        if dataset_type == 'landslide' or num_classes == 2:
+            print(f"\n* [PRIMARY METRIC] Landslide (Class 1) IoU: {iou_per_class[1]:.4f} | F1-Score: {f1score[1]:.4f}")
+
+        print(f'\n* Average time cost per frame: {mean_time_ms:.2f} ms (over {timed_frames} timed frames) -> {fps:.2f} FPS')
+        print('###########################################################################')
+    else:
+        # Dedicated prediction-only mode summary
+        device_name = torch.cuda.get_device_name(args.gpu) if torch.cuda.is_available() else 'CPU'
+        print('\n###########################################################################')
+        print('\n%s: %s prediction-only inference on %s using %s:' % (args.model_name, args.weight_name, datetime.date.today(), device_name)) 
+        print('\n* Mode: Dedicated Prediction-Only (Ground-truth labels suppressed)')
+        print('* Tested dataset: %s (split: %s)' % (dataset_type, args.dataset_split))
+        print('* Inferred image count: %d' % len(test_loader))
+        print('* Inferred image size: %d x %d' % (img_h, img_w)) 
+        print('* Weight dir: %s' % args.weight_name) 
+        print('* Checkpoint file: %s' % args.file_name)
+        print('* Output directory: %s' % save_demo_dir)
+        print(f'* Average time cost per frame: {mean_time_ms:.2f} ms (over {timed_frames} timed frames) -> {fps:.2f} FPS')
+        print('###########################################################################')
+
+
+if __name__ == '__main__':
+    main()

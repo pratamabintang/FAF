@@ -88,10 +88,23 @@ def get_palette(dataset: str = "landslide", num_classes: int = 2) -> np.ndarray:
     return np.array(palette[:num_classes], dtype=np.uint8)
 
 
-def colorize_mask(mask: np.ndarray, palette: np.ndarray) -> np.ndarray:
-    """Applies RGB palette to integer segmentation mask."""
-    mask_clipped = np.clip(mask, 0, len(palette) - 1).astype(np.uint8)
-    return palette[mask_clipped]
+def colorize_mask(
+    mask: np.ndarray,
+    palette: np.ndarray,
+    ignore_index: int = -100,
+    nodata_color: Union[Tuple[int, int, int], List[int], np.ndarray] = (128, 128, 128)
+) -> np.ndarray:
+    """
+    Applies RGB palette to integer segmentation mask.
+    Renders NoData pixels (ignore_index or negative values) in neutral gray ([128, 128, 128]).
+    """
+    is_nodata = (mask == ignore_index) | (mask < 0)
+    safe_mask = np.where(is_nodata, 0, mask)
+    mask_clipped = np.clip(safe_mask, 0, len(palette) - 1).astype(np.uint8)
+    colored = palette[mask_clipped].copy()
+    if np.any(is_nodata):
+        colored[is_nodata] = np.array(nodata_color, dtype=np.uint8)
+    return colored
 
 
 def visualize(
@@ -103,11 +116,16 @@ def visualize(
     labels: Optional[Union[torch.Tensor, np.ndarray]] = None,
     dataset: str = "landslide",
     save_dir: str = "./runs/demo_results",
-    save_side_by_side: bool = True
+    save_side_by_side: bool = True,
+    ignore_index: int = -100,
+    nodata_color: Tuple[int, int, int] = (128, 128, 128)
 ):
     """
-    Saves color-mapped predictions and optional comprehensive side-by-side diagnostic panels:
-      [RGB | DTM/IR Normalized | Ground Truth | Prediction Overlay]
+    Saves color-mapped predictions and comprehensive side-by-side diagnostic panels:
+      - With ground truth: [RGB | DTM/IR Normalized | Ground Truth | Prediction Overlay] (4 panels)
+      - Prediction-only (labels=None): [RGB | DTM/IR Normalized | Prediction Overlay] (3 panels)
+    Renders NoData pixels (ignore_index = -100) in neutral gray ([128, 128, 128]) across all panels
+    to eliminate false-positive visual artifacts outside valid survey terrain.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -132,16 +150,27 @@ def visualize(
     lbl_np = labels.detach().cpu().numpy() if hasattr(labels, "cpu") else (np.asarray(labels) if labels is not None else None)
 
     for idx, name in enumerate(image_name):
-        pred_mask = preds[idx].astype(np.uint8)
-        color_pred = colorize_mask(pred_mask, palette)
+        pred_mask = preds[idx].astype(np.int64)
+
+        # Check if ground truth labels are provided for this sample
+        cur_lbl = None
+        nodata_mask = None
+        if lbl_np is not None:
+            cur_lbl = lbl_np[idx]
+            if cur_lbl.ndim == 3:
+                cur_lbl = cur_lbl[0]
+            nodata_mask = (cur_lbl == ignore_index) | (cur_lbl < 0)
 
         # 1. Save raw colored prediction mask
+        color_pred = colorize_mask(pred_mask, palette, ignore_index=ignore_index, nodata_color=nodata_color)
+        if nodata_mask is not None and np.any(nodata_mask):
+            color_pred[nodata_mask] = np.array(nodata_color, dtype=np.uint8)
+
         out_mask_path = os.path.join(save_dir, f"{name}_{weight_name}_mask.png")
         cv2.imwrite(out_mask_path, cv2.cvtColor(color_pred, cv2.COLOR_RGB2BGR))
 
-        # 2. If RGB/DTM/Labels available and side_by_side requested, save multi-panel comparison
+        # 2. If RGB available and side_by_side requested, save multi-panel comparison
         if save_side_by_side and rgb_np is not None:
-            # Prepare RGB image [H, W, 3] in [0, 255]
             cur_rgb = rgb_np[idx]
             if cur_rgb.ndim == 3 and cur_rgb.shape[0] == 3:
                 cur_rgb = np.transpose(cur_rgb, (1, 2, 0))
@@ -166,35 +195,52 @@ def visualize(
                 cur_ir = ir_np[idx]
                 if cur_ir.ndim == 3:
                     cur_ir = cur_ir[0]
-                # Min-max normalization for visualization
-                ir_min, ir_max = np.min(cur_ir), np.max(cur_ir)
-                if ir_max > ir_min:
-                    ir_vis = ((cur_ir - ir_min) / (ir_max - ir_min) * 255.0).astype(np.uint8)
+                # Min-max normalization for visualization on valid pixels
+                if nodata_mask is not None and np.any(nodata_mask):
+                    valid_ir = cur_ir[~nodata_mask]
+                    if len(valid_ir) > 0 and np.max(valid_ir) > np.min(valid_ir):
+                        ir_min, ir_max = float(np.min(valid_ir)), float(np.max(valid_ir))
+                        ir_vis = np.clip((cur_ir - ir_min) / (ir_max - ir_min) * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        ir_vis = np.zeros((H, W), dtype=np.uint8)
                 else:
-                    ir_vis = np.zeros((H, W), dtype=np.uint8)
-                ir_vis_color = cv2.applyColorMap(ir_vis, cv2.COLORMAP_TURBO)
-            else:
-                ir_vis_color = np.zeros((H, W, 3), dtype=np.uint8)
+                    ir_min, ir_max = float(np.min(cur_ir)), float(np.max(cur_ir))
+                    if ir_max > ir_min:
+                        ir_vis = ((cur_ir - ir_min) / (ir_max - ir_min) * 255.0).astype(np.uint8)
+                    else:
+                        ir_vis = np.zeros((H, W), dtype=np.uint8)
 
-            # Ground Truth Color
-            if lbl_np is not None:
-                cur_lbl = lbl_np[idx]
-                if cur_lbl.ndim == 3:
-                    cur_lbl = cur_lbl[0]
-                color_gt = colorize_mask(cur_lbl.astype(np.uint8), palette)
+                ir_vis_color = cv2.applyColorMap(ir_vis, cv2.COLORMAP_TURBO)
+                ir_vis_rgb = cv2.cvtColor(ir_vis_color, cv2.COLOR_BGR2RGB)
+                if nodata_mask is not None and np.any(nodata_mask):
+                    ir_vis_rgb[nodata_mask] = np.array(nodata_color, dtype=np.uint8)
             else:
-                color_gt = np.zeros((H, W, 3), dtype=np.uint8)
+                ir_vis_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+            # Ground Truth Color (if labels provided)
+            color_gt = None
+            if cur_lbl is not None:
+                color_gt = colorize_mask(cur_lbl, palette, ignore_index=ignore_index, nodata_color=nodata_color)
 
             # Overlay Prediction on RGB (Alpha = 0.5)
             overlay = cur_rgb.copy()
             landslide_pixels = (pred_mask > 0)
+            if nodata_mask is not None and np.any(nodata_mask):
+                landslide_pixels = landslide_pixels & (~nodata_mask)
             if np.any(landslide_pixels):
                 overlay[landslide_pixels] = (
                     0.5 * cur_rgb[landslide_pixels] + 0.5 * color_pred[landslide_pixels]
                 ).astype(np.uint8)
+            if nodata_mask is not None and np.any(nodata_mask):
+                overlay[nodata_mask] = np.array(nodata_color, dtype=np.uint8)
 
-            # Assemble 4-panel grid: [RGB | DTM | Ground Truth | Prediction Overlay]
-            panel = np.hstack([cur_rgb, cv2.cvtColor(ir_vis_color, cv2.COLOR_BGR2RGB), color_gt, overlay])
+            # Assemble diagnostic grid:
+            # - If ground truth available: 4 panels [RGB | DTM | Ground Truth | Prediction Overlay]
+            # - Prediction-only: 3 panels [RGB | DTM | Prediction Overlay] (suppressing fake Ground Truth)
+            if color_gt is not None:
+                panel = np.hstack([cur_rgb, ir_vis_rgb, color_gt, overlay])
+            else:
+                panel = np.hstack([cur_rgb, ir_vis_rgb, overlay])
 
             panel_bgr = cv2.cvtColor(panel, cv2.COLOR_RGB2BGR)
             out_panel_path = os.path.join(save_dir, f"{name}_{weight_name}_diagnostic.png")

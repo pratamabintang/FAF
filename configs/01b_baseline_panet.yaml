@@ -1,0 +1,117 @@
+# ==============================================================================
+# FAF Experiment Configuration - Architectural Baseline: Base PANet Decoder
+# (Decoupled Decoder Baseline: PANet without deep supervision, no novel FAF modules)
+# ==============================================================================
+
+# --- 1. Experiment & Logging Metadata ---
+exp_name: "01b_baseline_panet"
+exp_dir: "Experiments"
+log_interval: 10
+verbose: true
+use_wandb: false
+
+# --- 2. Determinism & Reproducibility ---
+seed: 42
+deterministic: false
+benchmark: true
+
+# --- 3. Hardware & System Configuration ---
+gpu: 0
+multi_gpu: false
+num_workers: 4
+grad_accum_steps: 1
+
+# --- 4. Dataset Configuration (Landslide Multimodal: RGB + DTM) ---
+dataset: "landslide"
+data_root: "./dataset/dataset_1"
+train_source: "train"
+img_height: 512
+img_width: 512
+num_classes: 2
+ignore_unlabeled: false
+
+# DTM Elevation Normalization Statistics
+dtm_norm: "standard"
+dtm_mean: 72.82
+dtm_std: 58.01
+
+# Topographic Derivatives & Sampling Configuration
+include_derivatives: false
+pixel_scale: 1.0
+ignore_nodata: true
+positive_aware_sampling: true
+positive_sample_prob: 0.5
+positive_aware_sampler: false
+
+# --- 5. Model Architecture & Modality Operating Mode ---
+rgb_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+ir_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+context_dim: "[96,192,384,768]"
+modal_mode: "multimodal"                # Options: "multimodal" | "rgb_only" | "dtm_only"
+fusion_strategy: "average_summation"
+fuse_type: "scalar"
+distill_type: "mul"
+freeze_backbones: false
+distill_layers_enabled: false
+
+# Architectural Baseline: PANet without Deep Supervision
+decoder_type: "panet"                   # Decoupled architectural baseline
+deep_supervision: false
+enhanced_fusion: false
+use_safd: false                         # No novel modules active
+use_cafg: false
+use_tpsw: false
+
+# Pretrained weights / Checkpoint Resume
+rgb_model_path: ""
+ir_model_path: ""
+resume: false
+resume_with_reset: false
+resume_from: ""
+
+# --- 6. Training & Optimization ---
+epochs: 300
+batch_size: 4
+optimizer: "adamw"
+lr_backbone: 0.00003
+lr_fusion: 0.0003
+lr_decoder: 0.0003
+weight_decay: 0.01
+clip_grad: 0.1
+
+# Learning Rate Scheduler
+scheduler: "cosine_warmup"
+warmup_epochs: 10
+flat_epochs: 10
+t0: 50
+step_size: 45
+
+# --- 7. Loss Functions ---
+loss_type: "combo3"
+ce_weight: 0.35
+dice_weight: 0.35
+lovasz_weight: 0.30
+label_smoothing: 0.0
+class_weights: true
+class_weight_multiplier: 10.0
+
+# Auxiliary Loss
+aux_weight_start: 0.3
+aux_weight_end: 0.05
+aux_weight_decay_epoch: 80
+
+# Hard Example Mining & Boundary Loss
+ohem_weight: 0.1
+boundary_weight: 0.1
+ohem_thresh: 0.7
+ohem_min_kept: 50000
+focal_weight: 0.5
+focal_gamma: 2.0
+focal_target_class: 1
+
+# --- 8. Evaluation & EMA ---
+ema: true
+ema_decay: 0.999
+eval_use_ema: true
+eval_tta: false
+tta_scales: [1.0]

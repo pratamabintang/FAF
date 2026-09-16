@@ -84,6 +84,7 @@ class LandslideDataset(Dataset):
         ignore_index: int = -100,
         positive_aware_sampling: bool = False,
         positive_sample_prob: float = 0.5,
+        scale_crop_prob: float = 0.5,
         require_labels: Optional[bool] = None,
     ):
         super().__init__()
@@ -103,10 +104,14 @@ class LandslideDataset(Dataset):
         self.ignore_index = int(ignore_index)
         self.positive_aware_sampling = positive_aware_sampling
         self.positive_sample_prob = float(positive_sample_prob)
-        if require_labels is None:
-            self.require_labels = (self.split in {"train", "val", "test"})
-        else:
-            self.require_labels = bool(require_labels)
+        self.scale_crop_prob = float(scale_crop_prob)
+        # Note on effective positive-aware crop probability:
+        # For samples containing landslides, the joint probability of a positive-centered crop is
+        # p_eff = scale_crop_prob * positive_sample_prob (default: 0.5 * 0.5 = 0.25).
+        self.require_labels = (
+            require_labels if require_labels is not None else (split in {"train", "val", "test"})
+        )
+        self._positive_cache: Dict[int, bool] = {}
 
         # Resolve split directory
         split_candidates = [
@@ -310,11 +315,14 @@ class LandslideDataset(Dataset):
         rgb: np.ndarray,
         dtm: np.ndarray,
         mask: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """
         Applies strictly coordinated spatial transformations (flip, rotate90, crop)
         across RGB, DTM, and Mask simultaneously.
+        Returns transformed (rgb, dtm, mask, effective_pixel_scale).
         """
+        effective_pixel_scale = self.pixel_scale
+
         # Random Horizontal Flip
         if random.random() > 0.5:
             rgb = np.fliplr(rgb).copy()
@@ -335,7 +343,9 @@ class LandslideDataset(Dataset):
             mask = np.rot90(mask, rot_k).copy()
 
         # Random Coordinated Scale Crop (Between 80% and 100% of spatial dimension)
-        if random.random() > 0.5:
+        # Effective positive-aware sampling probability on positive samples:
+        # p_eff = scale_crop_prob * positive_sample_prob (default: 0.5 * 0.5 = 0.25)
+        if random.random() < self.scale_crop_prob:
             h, w = dtm.shape
             crop_ratio = random.uniform(0.8, 1.0)
             crop_h, crop_w = int(h * crop_ratio), int(w * crop_ratio)
@@ -360,12 +370,19 @@ class LandslideDataset(Dataset):
             dtm_cropped = dtm[top:top+crop_h, left:left+crop_w]
             mask_cropped = mask[top:top+crop_h, left:left+crop_w]
 
-            # Bilinear for RGB and DTM, Nearest for Mask
+            # Bilinear for RGB and DTM, Nearest for Mask (via float32 to ensure OpenCV compatibility)
             rgb = cv2.resize(rgb_cropped, (w, h), interpolation=cv2.INTER_LINEAR)
             dtm = cv2.resize(dtm_cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-            mask = cv2.resize(mask_cropped.astype(np.int64), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.int64)
+            mask = cv2.resize(mask_cropped.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.int64)
+            assert set(np.unique(mask)).issubset({0, 1, self.ignore_index}), (
+                f"Corrupted mask labels after scale-crop resize: {set(np.unique(mask))}"
+            )
 
-        return rgb, dtm, mask
+            # Physical scale scaling: stretching a smaller crop back to full size
+            # makes each pixel represent fewer meters on the ground
+            effective_pixel_scale = self.pixel_scale * crop_ratio
+
+        return rgb, dtm, mask, effective_pixel_scale
 
     def _apply_rgb_color_aug(self, rgb: np.ndarray) -> np.ndarray:
         """Applies photometric color augmentations ONLY to RGB channels."""
@@ -391,13 +408,22 @@ class LandslideDataset(Dataset):
 
         return rgb
 
-    def _normalize_terrain(self, dtm: np.ndarray) -> np.ndarray:
+    def _normalize_terrain(self, dtm: np.ndarray, effective_pixel_scale: Optional[float] = None) -> np.ndarray:
         """Normalizes DTM elevation into standardized float32 range and computes physical derivatives."""
-        if self.dtm_norm == "standard":
+        norm_type = str(self.dtm_norm).lower()
+        if norm_type == "standard":
             dtm_norm = (dtm - self.dtm_mean) / self.dtm_std
-        elif self.dtm_norm == "minmax":
+        elif norm_type == "minmax":
             d_min, d_max = np.min(dtm), np.max(dtm)
             dtm_norm = (dtm - d_min) / (d_max - d_min + 1e-6)
+        elif norm_type in ("local_relief", "relative"):
+            # Relative local relief: subtract patch-minimum to prevent absolute elevation shortcuts
+            d_min, d_max = np.min(dtm), np.max(dtm)
+            relief_range = max(float(d_max - d_min), 1e-3)
+            dtm_norm = (dtm - d_min) / relief_range
+        elif norm_type == "slope_only":
+            # Zero out elevation channel to evaluate pure morphology without elevation bias
+            dtm_norm = np.zeros_like(dtm, dtype=np.float32)
         else:
             dtm_norm = dtm
 
@@ -406,7 +432,8 @@ class LandslideDataset(Dataset):
 
         # Expand channel dimension -> (K, H, W) where K=1 (or K=4 if derivatives enabled: [DTM, Slope, Sin_Aspect, Cos_Aspect])
         if self.include_derivatives:
-            gy, gx = np.gradient(dtm, self.pixel_scale, self.pixel_scale)
+            scale = self.pixel_scale if effective_pixel_scale is None else max(float(effective_pixel_scale), 1e-4)
+            gy, gx = np.gradient(dtm, scale, scale)
             slope_rad = np.arctan(np.sqrt(gx**2 + gy**2)).astype(np.float32)
             slope_norm = slope_rad / (np.pi / 2.0)  # Normalized to [0, 1] relative to 90 degrees
 
@@ -423,6 +450,30 @@ class LandslideDataset(Dataset):
             terrain = dtm_norm[np.newaxis, :, :]  # [1, H, W]
 
         return terrain
+
+    def sample_has_positive(self, index: int) -> bool:
+        """
+        Determines whether the sample at the given index contains landslide foreground pixels (1 or 65535).
+        Caches results to accelerate repeated sampler initialization.
+        """
+        if index in self._positive_cache:
+            return self._positive_cache[index]
+
+        sample_meta = self.samples[index]
+        lbl_path = sample_meta.get("lbl_path")
+        if lbl_path is None or not Path(lbl_path).exists():
+            self._positive_cache[index] = False
+            return False
+
+        mask = cv2.imread(str(lbl_path), cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            mask = np.array(Image.open(str(lbl_path)))
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+
+        has_pos = bool(np.any((mask == 1) | (mask == 65535)))
+        self._positive_cache[index] = has_pos
+        return has_pos
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -450,10 +501,12 @@ class LandslideDataset(Dataset):
             rgb_raw, dtm_raw, mask_raw, self.target_h, self.target_w
         )
 
+        effective_pixel_scale = self.pixel_scale
+
         # 3. Training Augmentations
         if self.is_training:
             # [P1] Synchronized spatial crop / flip / rotate across all modalities
-            rgb_res, dtm_res, mask_res = self._apply_coordinated_spatial_aug(
+            rgb_res, dtm_res, mask_res, effective_pixel_scale = self._apply_coordinated_spatial_aug(
                 rgb_res, dtm_res, mask_res
             )
             # [P1] Photometric color augmentation ONLY on RGB (NOT on DTM)
@@ -464,7 +517,7 @@ class LandslideDataset(Dataset):
         rgb_tensor = torch.from_numpy(rgb_float.transpose(2, 0, 1)).contiguous().float()
 
         # 5. Normalize Terrain -> float32 [K, H, W]
-        terrain_np = self._normalize_terrain(dtm_res)
+        terrain_np = self._normalize_terrain(dtm_res, effective_pixel_scale=effective_pixel_scale)
         terrain_tensor = torch.from_numpy(terrain_np).contiguous().float()
 
         # 6. Mask -> int64 [H, W]

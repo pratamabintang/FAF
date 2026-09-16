@@ -85,42 +85,69 @@ class ModelEMA:
             self.shadow[k] = v.clone().to(device)
 
 # ---- Lovasz + Dice + CE (label smoothing) ----
+def lovasz_grad(gt_sorted):
+    """
+    Computes gradient of the Lovasz extension w.r.t sorted errors.
+    See Berman et al. CVPR 2018 (Alg. 1).
+    """
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1.0 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
 def lovasz_softmax(logits, labels, classes='present', eps=1e-6, ignore_index=-100):
-    # logits: [B,C,H,W], labels: [B,H,W]
+    """
+    Multi-class / binary Lovasz-Softmax loss using the Lovasz extension of Jaccard loss.
+    logits: [B, C, H, W]
+    labels: [B, H, W]
+    """
     probs = torch.softmax(logits.float(), dim=1)
     B, C, H, W = probs.shape
     valid = (labels != ignore_index)
-    
+    if not valid.any():
+        return probs.new_tensor(0.0)
+
     if C == 2:
-        # Binary Landslide: optimize foreground (Class 1) directly
+        # Binary Landslide segmentation: focus on foreground (Class 1)
         fg = (labels == 1).float()
-        if fg.sum() == 0 or not valid.any():
-            return probs.new_tensor(0.)
-        pc = probs[:, 1, ...]
         fg_valid = fg[valid]
-        pc_valid = pc[valid]
-        if fg_valid.numel() == 0 or fg_valid.sum() == 0:
-            return probs.new_tensor(0.)
-        errors = (fg_valid - pc_valid).abs()
+        p_fg_valid = probs[:, 1, ...][valid]
+
+        if fg_valid.numel() == 0:
+            return probs.new_tensor(0.0)
+
+        if fg_valid.sum() == 0:
+            # All-negative batch: penalize false positives on valid territory.
+            # Combines peak false positive (exact Lovasz extension) + mean false positive mass.
+            return 0.5 * (p_fg_valid.mean() + p_fg_valid.max())
+
+        errors = (fg_valid - p_fg_valid).abs()
         errors_sorted, perm = torch.sort(errors, descending=True)
         gt_sorted = fg_valid[perm]
-        grad = torch.cumsum(gt_sorted, 0) / (gt_sorted.sum() + eps)
-        grad = 1.0 - grad
-        return torch.dot(errors_sorted, grad) / max(fg_valid.numel(), 1)
-    
+        grad = lovasz_grad(gt_sorted)
+        return torch.dot(errors_sorted, grad)
+
+    # Multiclass fallback
+    vlabels = labels[valid]
+    vprobs = probs.permute(0, 2, 3, 1).contiguous().view(-1, C)[valid.view(-1)]
     losses = []
-    for c in range(C):
-        fg = (labels == c).float()
-        if classes == 'present' and fg.sum() == 0:
+    classes_to_sum = list(range(C)) if classes in ['all', 'present'] else classes
+    for c in classes_to_sum:
+        fg_c = (vlabels == c).float()
+        if classes == 'present' and fg_c.sum() == 0:
             continue
-        pc = probs[:, c, ...]
-        errors = (fg - pc).abs().reshape(-1)
+        p_c = vprobs[:, c]
+        errors = (fg_c - p_c).abs()
         errors_sorted, perm = torch.sort(errors, descending=True)
-        gt_sorted = fg.reshape(-1)[perm]
-        grad = torch.cumsum(gt_sorted, 0) / (gt_sorted.sum() + eps)
-        grad = 1.0 - grad
-        losses.append(torch.dot(errors_sorted, grad) / total_pixels)
-    return torch.stack(losses).mean() if len(losses) else probs.new_tensor(0.)
+        gt_sorted = fg_c[perm]
+        losses.append(torch.dot(errors_sorted, lovasz_grad(gt_sorted)))
+    return torch.stack(losses).mean() if len(losses) else probs.new_tensor(0.0)
+
 
 # ---- Focal Loss for Hard Examples ----
 class FocalLoss(nn.Module):
@@ -129,7 +156,7 @@ class FocalLoss(nn.Module):
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
     Focuses training on hard, misclassified examples.
     """
-    def __init__(self, gamma=2.0, alpha=None, target_class=1, ignore_index=255):
+    def __init__(self, gamma=2.0, alpha=None, target_class=1, ignore_index=-100):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
@@ -190,6 +217,9 @@ class ComboLoss3(nn.Module):
 
     def forward(self, logits, y):
         logits = logits.float()
+        valid = (y != self.ignore_index)
+        if not valid.any():
+            return logits.new_tensor(0.0)
         return (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
               + self.lovasz_w * lovasz_softmax(logits, y, ignore_index=self.ignore_index))
@@ -201,7 +231,7 @@ class OHEMCrossEntropyLoss(nn.Module):
     Online Hard Example Mining - focuses on hardest pixels.
     Optimized for high GPU throughput without synchronization stalls.
     """
-    def __init__(self, ignore_index=255, thresh=0.7, min_kept=50000, weight=None):
+    def __init__(self, ignore_index=-100, thresh=0.7, min_kept=50000, weight=None):
         super().__init__()
         self.ignore_index = ignore_index
         self.thresh = thresh
@@ -216,7 +246,7 @@ class OHEMCrossEntropyLoss(nn.Module):
         loss_flat = loss.view(-1)[valid_mask]
         
         if loss_flat.numel() == 0:
-            return loss.mean()
+            return loss.new_tensor(0.0)
         
         num_pixels = loss_flat.numel()
         min_kept = min(self.min_kept, num_pixels)
@@ -241,9 +271,10 @@ class OHEMCrossEntropyLoss(nn.Module):
 class BoundaryLoss(nn.Module):
     """
     Boundary-aware loss to improve edge detection.
-    Batched depthwise conv implementation for fast execution.
+    Batched depthwise conv implementation with morphological valid-mask erosion (3x3 kernel)
+    to strictly isolate valid territory from NoData boundary contamination.
     """
-    def __init__(self, num_classes=2, ignore_index=255, kernel_size=3):
+    def __init__(self, num_classes=2, ignore_index=-100, kernel_size=3):
         super().__init__()
         self.num_classes = num_classes
         self.ignore_index = ignore_index
@@ -267,6 +298,18 @@ class BoundaryLoss(nn.Module):
     
     def forward(self, logits, targets):
         logits = logits.float()
+        valid_mask = (targets != self.ignore_index).float()
+        
+        # Erode valid_mask by kernel size (3x3) to exclude pixels bordering NoData
+        # A pixel is only valid for boundary computation if all 3x3 neighbors are valid
+        valid_4d = valid_mask.unsqueeze(1)
+        invalid_4d = 1.0 - valid_4d
+        max_invalid = F.max_pool2d(invalid_4d, kernel_size=self.kernel_size, stride=1, padding=self.kernel_size // 2)
+        eroded_valid = (1.0 - max_invalid).squeeze(1)
+        
+        if eroded_valid.sum() == 0:
+            return logits.new_tensor(0.0)
+            
         gt_boundary = self.get_boundary(targets)  # [B, H, W]
         
         probs = torch.softmax(logits, dim=1)
@@ -274,16 +317,15 @@ class BoundaryLoss(nn.Module):
         edges = F.conv2d(probs, weight, padding=1, groups=self.num_classes)
         pred_boundary = torch.clamp(edges.abs().max(dim=1)[0], 0.0, 1.0)
         
-        valid_mask = (targets != self.ignore_index).float()
         boundary_weight = 1.0 + 2.0 * gt_boundary
         
         loss = F.binary_cross_entropy(
             pred_boundary,
             gt_boundary,
-            weight=boundary_weight * valid_mask,
+            weight=boundary_weight * eroded_valid,
             reduction='sum'
         )
-        return loss / (valid_mask.sum() + 1e-6)
+        return loss / (eroded_valid.sum() + 1e-6)
 
 
 # ---- Enhanced ComboLoss with OHEM and Boundary ----
@@ -293,9 +335,9 @@ class ComboLossOHEM(nn.Module):
     Optimized for rare class detection (guardrail, car_stop, bump, landslide)
     """
     def __init__(self, ce_w=0.4, dice_w=0.2, lovasz_w=0.2, ohem_w=0.1, boundary_w=0.1,
-                 class_weights=None, ignore_index=255, num_classes=9,
+                 class_weights=None, ignore_index=-100, num_classes=2,
                  ohem_thresh=0.7, ohem_min_kept=100000,
-                 focal_weight=0.0, focal_gamma=2.0, focal_target_class=6):
+                 focal_weight=0.0, focal_gamma=2.0, focal_target_class=1):
         super().__init__()
         
         self.ignore_index = ignore_index
@@ -354,6 +396,9 @@ class ComboLossOHEM(nn.Module):
     
     def forward(self, logits, y):
         logits = logits.float()
+        valid = (y != self.ignore_index)
+        if not valid.any():
+            return logits.new_tensor(0.0)
         loss = (self.ce_w * self.ce(logits, y)
               + self.dice_w * self.dice(logits, y)
               + self.lovasz_w * lovasz_softmax(logits, y, ignore_index=self.ignore_index)
@@ -388,7 +433,10 @@ class FusionTrainer:
         
         # Set random seeds
         self.set_seed(config.seed)
-        
+
+        # Audit and clarify configuration fields
+        self._audit_configuration()
+
         # Setup directories
         self.setup_directories()
         
@@ -435,7 +483,25 @@ class FusionTrainer:
             print(f"[REPRODUCIBILITY] Seed={seed} | CUDNN Deterministic=True | Benchmark=False")
         else:
             print(f"[THROUGHPUT] Seed={seed} | CUDNN Benchmark=True | Deterministic=False")
-    
+
+    def _audit_configuration(self):
+        """Audits configuration parameters, logging active FAF options and clarifying legacy/no-op fields."""
+        print("=" * 80)
+        print("CONFIGURATION AUDIT: MULTIMODAL FREQUENCY-AWARE FUSION (FAF)")
+        print("=" * 80)
+        print(f"  Modality Backbones: RGB={self.config.rgb_arch} | Terrain/DTM={self.config.ir_arch}")
+        print(f"  Proposed Modules  : SAFD={getattr(self.config, 'use_safd', False)} | CAFG={getattr(self.config, 'use_cafg', False)} | TPSW={getattr(self.config, 'use_tpsw', False)}")
+        print(f"  Input Resolution  : {self.config.img_height}x{self.config.img_width} | Classes={self.config.num_classes}")
+        print(f"  Loss & Optimizer  : Type={self.config.loss_type} | Base WD={getattr(self.config, 'weight_decay', 0.01)}")
+
+        # Clarify legacy/dead config fields
+        legacy_fields = ['fuse_type', 'distill_type', 'fusion_strategy', 'flat_epochs']
+        for field in legacy_fields:
+            if hasattr(self.config, field):
+                val = getattr(self.config, field)
+                print(f"  [CONFIG AUDIT] Legacy field '{field}' = '{val}' (retained for CLI compatibility; overridden by FAF architecture).")
+        print("=" * 80)
+
     def setup_directories(self):
         """Create necessary directories"""
         self.exp_dir = Path(self.config.exp_dir) / self.config.exp_name
@@ -471,6 +537,7 @@ class FusionTrainer:
         include_derivatives = getattr(self.config, 'include_derivatives', False)
         ir_in_chans = 4 if include_derivatives else getattr(self.config, 'ir_in_chans', 1)
         self.config.ir_in_chans = ir_in_chans
+        modal_mode = getattr(self.config, 'modal_mode', 'multimodal')
         
         model = FusionModel(
             rgb_arch=self.config.rgb_arch,
@@ -487,7 +554,8 @@ class FusionTrainer:
             use_safd=use_safd,
             use_cafg=use_cafg,
             use_tpsw=use_tpsw,
-            ir_in_chans=ir_in_chans
+            ir_in_chans=ir_in_chans,
+            modal_mode=modal_mode
         )
         
         model = model.to(self.device)
@@ -589,14 +657,9 @@ class FusionTrainer:
         if use_sampler:
             print("[INFO] Computing sample weights for positive-aware WeightedRandomSampler...")
             sample_weights = []
-            for s in train_dataset.samples:
-                lbl_path = s.get("lbl_path")
-                if lbl_path and os.path.exists(lbl_path):
-                    raw_mask = train_dataset._read_mask(lbl_path)
-                    has_pos = bool((raw_mask == 1).any())
-                    sample_weights.append(5.0 if has_pos else 1.0)
-                else:
-                    sample_weights.append(1.0)
+            for idx in range(len(train_dataset)):
+                has_pos = train_dataset.sample_has_positive(idx)
+                sample_weights.append(5.0 if has_pos else 1.0)
             sampler = torch.utils.data.WeightedRandomSampler(
                 weights=sample_weights,
                 num_samples=len(train_dataset),
@@ -699,26 +762,41 @@ class FusionTrainer:
         return criterion_main, criterion_aux
     
     def calculate_class_weights(self):
-        print("Calculating class weights directly from raw training labels...")
+        print("Calculating class weights directly from raw training labels (DTM validity-filtered)...")
         class_counts = torch.zeros(self.config.num_classes, device=self.device)
 
         dataset = self.train_loader.dataset
         if hasattr(dataset, "samples") and len(dataset.samples) > 0:
+            nodata_val = getattr(dataset, "nodata_value", -9999.0)
             for s in tqdm(dataset.samples, desc="Computing class weights (raw labels)"):
                 lbl_path = s.get("lbl_path")
+                dtm_path = s.get("dtm_path")
                 if lbl_path and os.path.exists(lbl_path):
                     raw_mask = cv2.imread(str(lbl_path), cv2.IMREAD_UNCHANGED)
-                    if raw_mask is not None:
-                        if raw_mask.ndim == 3:
-                            raw_mask = raw_mask[:, :, 0]
-                        # Map to integer class (0=BG, 1=Landslide)
-                        cls_mask = torch.from_numpy(((raw_mask == 1) | (raw_mask == 65535)).astype(np.int64))
-                        valid = (cls_mask >= 0) & (cls_mask < self.config.num_classes)
-                        class_counts += torch.bincount(cls_mask[valid].to(self.device), minlength=self.config.num_classes)
+                    if raw_mask is None:
+                        continue
+                    if raw_mask.ndim == 3:
+                        raw_mask = raw_mask[:, :, 0]
+
+                    # Filter by DTM validity if DTM exists
+                    valid_terrain = np.ones(raw_mask.shape, dtype=bool)
+                    if dtm_path and os.path.exists(dtm_path):
+                        raw_dtm = cv2.imread(str(dtm_path), cv2.IMREAD_UNCHANGED)
+                        if raw_dtm is not None:
+                            if raw_dtm.ndim == 3:
+                                raw_dtm = raw_dtm[:, :, 0]
+                            raw_dtm_f = raw_dtm.astype(np.float32)
+                            valid_terrain = (~np.isnan(raw_dtm_f)) & (~np.isinf(raw_dtm_f)) & (raw_dtm_f > nodata_val)
+
+                    # Map to integer class (0=BG, 1=Landslide)
+                    cls_mask = torch.from_numpy(((raw_mask == 1) | (raw_mask == 65535)).astype(np.int64))
+                    valid = (cls_mask >= 0) & (cls_mask < self.config.num_classes) & torch.from_numpy(valid_terrain)
+                    class_counts += torch.bincount(cls_mask[valid].to(self.device), minlength=self.config.num_classes)
         else:
+            ignore_idx = getattr(dataset, "ignore_index", -100)
             for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
                 mask = mask.to(self.device)
-                valid = (mask >= 0) & (mask < self.config.num_classes)
+                valid = (mask >= 0) & (mask < self.config.num_classes) & (mask != ignore_idx)
                 class_counts += torch.bincount(mask[valid], minlength=self.config.num_classes)
 
         freq = class_counts / class_counts.sum()
@@ -747,61 +825,63 @@ class FusionTrainer:
     def setup_optimizer(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
         base_lr = self.config.lr_backbone
-        decay = 0.90
+        decay = getattr(self.config, 'layer_decay', 0.90)
+        base_wd = getattr(self.config, 'weight_decay', 0.01)
 
         param_groups = {}
 
-        def get_rgb_layer_id(name):
-            if "stem" in name: return 0
-            if "stages_0" in name: return 1
-            if "stages_1" in name: return 2
-            if "stages_2" in name: return 3
-            if "stages_3" in name: return 4
+        def get_backbone_layer_id(name):
+            """
+            Matches timm ConvNeXt / ConvNeXtV2 naming patterns (supporting both
+            FeatureListNet 'stages_X' and standard 'stages.X'), as well as
+            EfficientNet ('blocks.X') and ResNet ('layerX').
+            """
+            if "stem" in name or "conv_stem" in name:
+                return 0
+            if "stages.0" in name or "stages_0" in name or "blocks.0" in name or "layer1" in name:
+                return 1
+            if "stages.1" in name or "stages_1" in name or "blocks.1" in name or "layer2" in name:
+                return 2
+            if "stages.2" in name or "stages_2" in name or "blocks.2" in name or "layer3" in name:
+                return 3
+            if "stages.3" in name or "stages_3" in name or "blocks.3" in name or "layer4" in name:
+                return 4
             return 5
-
-        def get_ir_layer_id(name):
-            if "conv_stem" in name: return 0
-            if "blocks.0" in name: return 1
-            if "blocks.1" in name: return 2
-            if "blocks.2" in name: return 3
-            if "blocks.3" in name: return 4
-            if "blocks.4" in name: return 5
-            return 6
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
 
             if name.startswith("rgb_encoder"):
-                layer_id = get_rgb_layer_id(name)
+                layer_id = get_backbone_layer_id(name)
                 lr = base_lr * (decay ** (5 - layer_id))
-                wd = 0.05
+                wd = base_wd
                 key = f"rgb_{layer_id}"
 
             elif name.startswith("ir_encoder"):
-                layer_id = get_ir_layer_id(name)
+                layer_id = get_backbone_layer_id(name)
                 lr = base_lr * (decay ** (5 - layer_id))
-                wd = 0.03
+                wd = base_wd
                 key = f"ir_{layer_id}"
 
             elif "fusion_stage" in name:
                 lr = self.config.lr_fusion
-                wd = 0.01
+                wd = base_wd
                 key = "fusion"
 
-            elif "thermal_prior" in name:
+            elif "terrain_prior" in name or "thermal_prior" in name:
                 lr = self.config.lr_fusion
-                wd = 0.01
-                key = "thermal_prior"
+                wd = base_wd
+                key = "terrain_prior"
 
             elif "decoder" in name:
                 lr = self.config.lr_decoder
-                wd = 0.005
+                wd = base_wd
                 key = "decoder"
 
             else:
                 lr = base_lr * 2.0
-                wd = 0.005
+                wd = base_wd
                 key = "other"
 
             if key not in param_groups:
@@ -814,16 +894,19 @@ class FusionTrainer:
 
             param_groups[key]["params"].append(param)
 
-
         # Create optimizer
         if self.config.optimizer == 'adamw':
             optimizer = torch.optim.AdamW(
                 list(param_groups.values()),
-                betas=(0.9, 0.999), 
-        )
+                betas=(0.9, 0.999),
+            )
         else:
             raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
-        
+
+        print(f"[OPTIMIZER] Initialized AdamW with {len(param_groups)} parameter groups (weight_decay={base_wd}):")
+        for gname, gdict in param_groups.items():
+            print(f"  - Group '{gname}': {len(gdict['params'])} tensors, lr={gdict['lr']:.2e}, wd={gdict['weight_decay']}")
+
         return optimizer
     
     def setup_scheduler(self):

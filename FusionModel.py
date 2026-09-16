@@ -62,6 +62,7 @@ class FusionModel(nn.Module):
         use_tpsw: bool = False,       # Novel: Terrain/Thermal Prior-Guided Spatial Weighting
         ir_in_chans: int = 1,         # Input channels for IR/Terrain (1 for DTM, 4 with derivatives)
         terrain_in_chans: Optional[int] = None,
+        modal_mode: str = "multimodal",  # Options: "multimodal" | "rgb_only" | "dtm_only"
     ):
         super().__init__()
 
@@ -69,6 +70,7 @@ class FusionModel(nn.Module):
         effective_terrain_in_chans = terrain_in_chans if terrain_in_chans is not None else ir_in_chans
         effective_terrain_resolution = terrain_backbone_resolution or ir_backbone_resolution
 
+        self.modal_mode = str(modal_mode).lower()
         self.decoder_type = decoder_type
         self.enhanced_fusion = enhanced_fusion
         self.use_safd = use_safd
@@ -84,20 +86,27 @@ class FusionModel(nn.Module):
         self.distill_layers_enabled = distill_layers_enabled
         self.fuse_type = fuse_type
         self.distill_type = distill_type
+        self.fusion_strategy = fusion_strategy
+        self.deep_supervision = deep_supervision
 
-        # --- 1. RGB Backbone (ConvNeXt V2) ---
+        # --- Context dimensions for ConvNeXt backbones ---
+        if context_dim is not None:
+            self.context_dim = context_dim
+        else:
+            self.context_dim = get_backbone_context_dim(rgb_arch)
+
+        # --- Multi-scale Backbones ---
         self.rgb_encoder = timm.create_model(
             rgb_arch,
-            pretrained=pretrained,
             features_only=True,
+            pretrained=pretrained,
+            in_chans=3
         )
-        
-        # --- 2. Terrain Backbone (ConvNeXt V2) ---
         self.ir_encoder = timm.create_model(
             effective_terrain_arch,
-            pretrained=pretrained,
             features_only=True,
-            in_chans=effective_terrain_in_chans, 
+            pretrained=pretrained,
+            in_chans=effective_terrain_in_chans,
         )
 
         # Learn channel configuration directly from encoders
@@ -209,11 +218,33 @@ class FusionModel(nn.Module):
         return features
 
         
-    def forward(self, rgb, ir=None, terrain=None):
+    def forward(self, rgb=None, ir=None, terrain=None):
         if terrain is None:
             terrain = ir
+
+        # Unimodal RGB-Only Baseline Mode
+        if self.modal_mode == "rgb_only":
+            if rgb is None:
+                raise ValueError("modal_mode='rgb_only' requires 'rgb' input tensor.")
+            rgb_features = self.extract_features(rgb, self.rgb_encoder)
+            fused = rgb_features
+            main_logits, aux_logits = self.decoder(fused)
+            return main_logits, aux_logits
+
+        # Unimodal DTM-Only Baseline Mode
+        if self.modal_mode in ("dtm_only", "ir_only"):
+            if terrain is None:
+                raise ValueError(f"modal_mode='{self.modal_mode}' requires 'terrain' or 'ir' input tensor.")
+            terrain_features = self.extract_features(terrain, self.ir_encoder)
+            fused = terrain_features
+            main_logits, aux_logits = self.decoder(fused)
+            return main_logits, aux_logits
+
+        # Standard Multimodal Mode
         if terrain is None:
-            raise ValueError("FusionModel requires either 'terrain' or 'ir' modality tensor.")
+            raise ValueError("FusionModel in multimodal mode requires either 'terrain' or 'ir' modality tensor.")
+        if rgb is None:
+            raise ValueError("FusionModel in multimodal mode requires 'rgb' input tensor.")
 
         # Extract multi-scale features from optical and terrain encoders
         rgb_features = self.extract_features(rgb, self.rgb_encoder)
@@ -232,8 +263,10 @@ class FusionModel(nn.Module):
         fused.append(self.fusion_stage4(rgb_features[3], terrain_features[3]))  # Stage 4 Fusion 
 
         # Apply Topographic Prior-Guided Spatial Weighting
+        # Centered formulation f * (0.5 + tp): enables bidirectional modulation
+        # (suppression by factor of 0.5 when tp=0; amplification by factor of 1.5 when tp=1)
         if self.use_tpsw:
-            fused = [f * (1 + tp) for f, tp in zip(fused, terrain_priors)]
+            fused = [f * (0.5 + tp) for f, tp in zip(fused, terrain_priors)]
 
         main_logits, aux_logits = self.decoder(fused)
         return main_logits, aux_logits
@@ -666,16 +699,23 @@ class AdaptiveGaussianLowPass(nn.Module):
 # ==========================================
 class ComplementarityAwareFusionGate(nn.Module):
     """
-    Measures optical-terrain complementarity via feature-space cosine distance,
-    then routes fusion through simple (for redundant regions) or deep
-    (for complementary regions) pathways.
+    Complementarity-Aware Fusion Gate (CAFG) for Cross-Modal Disagreement Routing.
     
-    Landslide Domain Formulation:
-    Optical imagery provides spectral texture and vegetation context, while DTM provides 
-    morphological surface elevation and slope structure.
-    Where optical and terrain cues are complementary (e.g. vegetated landslide scarps where
-    canopy obscures optical texture but terrain reveals the slope rupture), CAFG dynamically
-    activates deep non-linear multimodal reasoning.
+    Mathematical Formulation:
+      Given optical features f_rgb in R^{C x H x W} and terrain features f_terrain in R^{C x H x W},
+      CAFG computes their cosine distance in a learned bottleneck subspace:
+        d_cos(f_rgb, f_terrain) = 1.0 - <normalize(W_p f_rgb), normalize(W_p f_terrain)> in [0, 1]
+      
+    Scientific Domain Mechanics (Cross-Modal Disagreement Gating):
+      - Low Disagreement / Agreement (d_cos -> 0): Both optical spectral cues (e.g. bare ground texture)
+        and terrain morphometrics (e.g. steep slope scarp) concordantly identify identical surface structures.
+        Linear residual summation (f_rgb + f_terrain) suffices without heavy cross-attention compute.
+      - High Disagreement / Cross-Modal Ambiguity (d_cos -> 1): Cross-modal signals conflict or decouple:
+          1. Dense forest canopy obscures optical textures while DTM laser penetration reveals hidden rupture scarps.
+          2. Cloud shadow or seasonal foliage changes degrade RGB while terrain geometry is invariant.
+          3. Flat farmland with soil color variations produces deceptive optical boundaries but flat DTM.
+        In high-disagreement regions, CAFG dynamically routes features through a non-linear multi-layer
+        cross-modal fusion pathway (self.deep_fuse) to resolve the conflicting evidentiary signals.
     """
     def __init__(self, channels, proj_dim=None):
         super().__init__()
@@ -688,7 +728,7 @@ class ComplementarityAwareFusionGate(nn.Module):
             nn.BatchNorm2d(proj_dim)
         )
 
-        # Deep fusion path (activated for complementary regions)
+        # Deep fusion path (activated for complementary / high-disagreement regions)
         self.deep_fuse = nn.Sequential(
             nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -705,16 +745,16 @@ class ComplementarityAwareFusionGate(nn.Module):
         Returns:
             fused: [B, C, H, W]
         """
-        # Complementarity map via cosine distance in projected subspace
+        # Cross-modal disagreement / complementarity map via cosine distance in projected subspace
         rgb_proj = F.normalize(self.comp_proj(rgb_feat), dim=1)
         ir_proj = F.normalize(self.comp_proj(ir_feat), dim=1)
 
-        # High = complementary (distinct modality signals), Low = redundant (aligned signals)
+        # High = high disagreement / complementary (distinct modality signals), Low = agreement (aligned signals)
         comp_map = (1.0 - (rgb_proj * ir_proj).sum(dim=1, keepdim=True)).clamp(0, 1)
 
-        # Redundant regions → efficient residual summation
+        # Modality agreement regions -> efficient residual summation
         simple_out = rgb_feat + ir_feat
-        # Complementary regions → deep cross-modal convolution
+        # Modality disagreement / ambiguity regions -> deep non-linear cross-modal convolution
         deep_out = self.deep_fuse(torch.cat([rgb_feat, ir_feat], dim=1))
 
         return (1 - comp_map) * simple_out + comp_map * deep_out
@@ -732,6 +772,13 @@ class TerrainPriorModule(nn.Module):
     strongly correlate with landslide initiation zones and slip surfaces.
     This module uses the input elevation/terrain raster to generate multi-scale spatial priors
     to modulate fused cross-modal features across the network pyramid.
+
+    Bidirectional Modulation (Centered Prior Formulation):
+    The raw prior map tp in [0, 1] is applied to pyramid features via f * (0.5 + tp):
+      - Low prior (tp -> 0, e.g. flat plain/valley): multiplier = 0.5 (suppression of false alarms)
+      - Neutral prior (tp = 0.5, gentle terrain): multiplier = 1.0 (identity / neutral)
+      - High prior (tp -> 1, steep scarps/shear zones): multiplier = 1.5 (amplification of landslide cues)
+    This centers modulation around 1.0 and allows genuine bidirectional feature enhancement and attenuation.
     """
     def __init__(self, in_channels: int = 1):
         super().__init__()

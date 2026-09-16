@@ -54,11 +54,14 @@ def run_single_smoke_test(
     width: int,
     device: str,
     num_classes: int = 2,
+    ir_in_chans: int = 1,
+    modal_mode: str = "multimodal",
 ) -> bool:
     from FusionModel import FusionModel, get_backbone_context_dim
 
     print("\n" + "-" * 80)
     print(f"RUNNING TEST CONFIGURATION: {model_name}")
+    print(f"  Mode: {modal_mode.upper()} | Channels: RGB=3, DTM={ir_in_chans}")
     print(f"  Backbone: RGB={rgb_arch} | IR={ir_arch}")
     print(f"  Decoder: {decoder_type.upper()} (deep_supervision={deep_supervision})")
     print(f"  Novel Modules: SAFD={use_safd}, CAFG={use_cafg}, TPSW={use_tpsw}")
@@ -85,6 +88,8 @@ def run_single_smoke_test(
             use_safd=use_safd,
             use_cafg=use_cafg,
             use_tpsw=use_tpsw,
+            ir_in_chans=ir_in_chans,
+            modal_mode=modal_mode,
         )
         
         target_device = torch.device(device)
@@ -96,15 +101,29 @@ def run_single_smoke_test(
 
         # 2. Prepare Synthetic Data (RGB, DTM, Labels)
         torch.manual_seed(42)
-        rgb = torch.randn(batch_size, 3, height, width, device=target_device, requires_grad=True)
-        dtm = torch.randn(batch_size, 1, height, width, device=target_device, requires_grad=True)
+        if modal_mode == "rgb_only":
+            rgb = torch.randn(batch_size, 3, height, width, device=target_device, requires_grad=True)
+            dtm = None
+        elif modal_mode in ("dtm_only", "ir_only"):
+            rgb = None
+            dtm = torch.randn(batch_size, ir_in_chans, height, width, device=target_device, requires_grad=True)
+        else:
+            rgb = torch.randn(batch_size, 3, height, width, device=target_device, requires_grad=True)
+            dtm = torch.randn(batch_size, ir_in_chans, height, width, device=target_device, requires_grad=True)
         targets = torch.randint(0, num_classes, (batch_size, height, width), device=target_device, dtype=torch.long)
 
-        print(f"  [1/6] Inputs generated: RGB={list(rgb.shape)}, DTM={list(dtm.shape)}")
+        rgb_shape = list(rgb.shape) if rgb is not None else None
+        dtm_shape = list(dtm.shape) if dtm is not None else None
+        print(f"  [1/6] Inputs generated: RGB={rgb_shape}, DTM={dtm_shape} (mode={modal_mode})")
 
         # 3. Forward Pass
         optimizer.zero_grad()
-        main_logits, aux_logits = model(rgb, dtm)
+        if modal_mode == "rgb_only":
+            main_logits, aux_logits = model(rgb=rgb)
+        elif modal_mode in ("dtm_only", "ir_only"):
+            main_logits, aux_logits = model(terrain=dtm)
+        else:
+            main_logits, aux_logits = model(rgb=rgb, terrain=dtm)
 
         # 4. [P0] Assert Output Shape [B, 2, H, W]
         expected_shape = torch.Size([batch_size, num_classes, height, width])
@@ -158,8 +177,8 @@ def run_single_smoke_test(
         print(f"  [PASS] [P0] Gradients verified for {has_grads} parameter tensors (0 NaN/Inf).")
 
         # 7. [P0] Optimizer Step
-        # Store a snapshot of a parameter to verify weights change
-        sample_param = next(p for p in model.parameters() if p.requires_grad)
+        # Store a snapshot of a parameter with gradients to verify weights change
+        sample_param = next(p for p in model.parameters() if p.requires_grad and p.grad is not None)
         param_before = sample_param.data.clone()
 
         optimizer.step()
@@ -189,13 +208,20 @@ def main():
     parser.add_argument("--img_height", type=int, default=512, help="Input height (default: 512)")
     parser.add_argument("--img_width", type=int, default=512, help="Input width (default: 512)")
     parser.add_argument("--num_classes", type=int, default=2, help="Number of classes (default: 2 for binary segmentation)")
-    parser.add_argument("--arch", type=str, default="convnextv2_tiny.fcmae_ft_in22k_in1k_384",
-                        help="Backbone architecture (nano, tiny, or base)")
+    parser.add_argument("--arch", type=str, default=None,
+                        help="Backbone architecture to use or override (e.g. convnextv2_nano.fcmae_ft_in22k_in1k_384)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
                         help="Execution device: auto (detect GPU, else CPU), cpu, or cuda")
     parser.add_argument("--all_configs", action="store_true", default=False,
                         help="Run full matrix of configurations (Baseline + Novel + Deep Supervision)")
+    parser.add_argument("--yaml_configs", action="store_true", default=False,
+                        help="Discover and smoke test all YAML configuration files in configs/ directory")
+    parser.add_argument("--config_path", type=str, default=None,
+                        help="Path to a specific YAML configuration file to test")
     args = parser.parse_args()
+
+    default_arch = "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+    selected_arch = args.arch or default_arch
 
     # Determine device
     if args.device == "auto":
@@ -215,12 +241,41 @@ def main():
     print(f"  Output Dims     : Logits=[{args.batch_size}, {args.num_classes}, {args.img_height}, {args.img_width}]")
     print("=" * 80)
 
-    if args.all_configs:
+    if args.config_path or args.yaml_configs:
+        import yaml
+        from pathlib import Path
+        
+        if args.config_path:
+            yaml_paths = [Path(args.config_path).resolve()]
+        else:
+            configs_dir = Path(__file__).resolve().parent / "configs"
+            yaml_paths = sorted(configs_dir.glob("*.yaml"))
+
+        test_matrix = []
+        for yp in yaml_paths:
+            with open(yp, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            include_derivs = cfg.get("include_derivatives", False)
+            ir_chans = 4 if include_derivs else cfg.get("ir_in_chans", 1)
+            test_matrix.append({
+                "model_name": f"Config [{yp.name}]: {cfg.get('exp_name', yp.stem)}",
+                "rgb_arch": args.arch or cfg.get("rgb_backbone", default_arch),
+                "ir_arch": args.arch or cfg.get("ir_backbone", default_arch),
+                "decoder_type": cfg.get("decoder_type", "fpn"),
+                "use_safd": cfg.get("use_safd", False),
+                "use_cafg": cfg.get("use_cafg", False),
+                "use_tpsw": cfg.get("use_tpsw", False),
+                "deep_supervision": cfg.get("deep_supervision", False),
+                "ir_in_chans": ir_chans,
+                "modal_mode": cfg.get("modal_mode", "multimodal"),
+                "num_classes": cfg.get("num_classes", args.num_classes),
+            })
+    elif args.all_configs:
         test_matrix = [
             {
                 "model_name": "Config 1: Standard FPN Baseline",
-                "rgb_arch": args.arch,
-                "ir_arch": args.arch,
+                "rgb_arch": selected_arch,
+                "ir_arch": selected_arch,
                 "decoder_type": "fpn",
                 "use_safd": False,
                 "use_cafg": False,
@@ -229,8 +284,8 @@ def main():
             },
             {
                 "model_name": "Config 2: Novel FAF (PANet + SAFD + CAFG + TPSW + Deep Supervision)",
-                "rgb_arch": args.arch,
-                "ir_arch": args.arch,
+                "rgb_arch": selected_arch,
+                "ir_arch": selected_arch,
                 "decoder_type": "panet",
                 "use_safd": True,
                 "use_cafg": True,
@@ -239,8 +294,8 @@ def main():
             },
             {
                 "model_name": "Config 3: Novel FAF (PANet + SAFD Only)",
-                "rgb_arch": args.arch,
-                "ir_arch": args.arch,
+                "rgb_arch": selected_arch,
+                "ir_arch": selected_arch,
                 "decoder_type": "panet",
                 "use_safd": True,
                 "use_cafg": False,
@@ -252,8 +307,8 @@ def main():
         test_matrix = [
             {
                 "model_name": "Primary Smoke Test: Novel FAF (PANet + SAFD + CAFG + TPSW)",
-                "rgb_arch": args.arch,
-                "ir_arch": args.arch,
+                "rgb_arch": selected_arch,
+                "ir_arch": selected_arch,
                 "decoder_type": "panet",
                 "use_safd": True,
                 "use_cafg": True,
@@ -278,7 +333,9 @@ def main():
             height=args.img_height,
             width=args.img_width,
             device=device,
-            num_classes=args.num_classes,
+            num_classes=test_cfg.get("num_classes", args.num_classes),
+            ir_in_chans=test_cfg.get("ir_in_chans", 1),
+            modal_mode=test_cfg.get("modal_mode", "multimodal"),
         )
         results.append((test_cfg["model_name"], passed))
 

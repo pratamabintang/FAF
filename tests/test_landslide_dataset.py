@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 import numpy as np
 from PIL import Image
 import cv2
@@ -318,6 +319,200 @@ class TestLandslideDataset(unittest.TestCase):
                 _, _, mask, _ = dataset[0]
                 # Check that mask contains at least one landslide pixel (value 1)
                 self.assertTrue((mask == 1).any().item())
+
+    def test_sample_has_positive_and_crop_safety(self):
+        """Verify sample_has_positive public API and scale-crop float32 mask resize with ignore_index."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=2)
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train",
+                img_size=(64, 64),
+                is_training=True,
+                ignore_nodata=True,
+                ignore_index=-100
+            )
+            # Test sample_has_positive public API
+            has_pos_0 = dataset.sample_has_positive(0)
+            self.assertIsInstance(has_pos_0, bool)
+            self.assertTrue(has_pos_0)  # Synthetic dataset sample 0 has foreground
+            self.assertIn(0, dataset._positive_cache)
+
+            # Test spatial augmentation crop with mask containing -100
+            rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+            dtm = np.ones((64, 64), dtype=np.float32) * 50.0
+            mask = np.zeros((64, 64), dtype=np.int64)
+            mask[10:20, 10:20] = 1
+            mask[0:5, 0:5] = -100  # NoData region
+
+            for _ in range(10):
+                rgb_aug, dtm_aug, mask_aug, scale_aug = dataset._apply_coordinated_spatial_aug(rgb.copy(), dtm.copy(), mask.copy())
+                unique_vals = set(np.unique(mask_aug))
+                self.assertTrue(unique_vals.issubset({0, 1, -100}))
+                self.assertLessEqual(scale_aug, dataset.pixel_scale + 1e-6)
+
+    def test_topography_slope_and_aspect_coherence(self):
+        """Verify effective_pixel_scale preserves physical slope and aspect vectors transform coherently."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            train_dir = Path(tmpdir) / "train"
+            for sub in ["IMAGE", "DTM", "LABEL"]:
+                (train_dir / sub).mkdir(parents=True)
+
+            img = np.zeros((64, 64, 3), dtype=np.uint8)
+            # Create a uniform linear slope in x direction: dz/dx = 0.57735 (30 degrees slope)
+            y_grid, x_grid = np.mgrid[0:64, 0:64]
+            dtm = (0.57735 * x_grid).astype(np.float32)
+            mask = np.zeros((64, 64), dtype=np.uint8)
+
+            cv2.imwrite(str(train_dir / "IMAGE" / "tile_001.png"), img)
+            cv2.imwrite(str(train_dir / "DTM" / "tile_001.tif"), dtm)
+            cv2.imwrite(str(train_dir / "LABEL" / "tile_001.png"), mask)
+
+            dataset = LandslideDataset(
+                data_dir=tmpdir,
+                split="train",
+                img_size=(64, 64),
+                include_derivatives=True,
+                pixel_scale=1.0,
+                is_training=False
+            )
+
+            # 1. Uncropped physical slope verification
+            terrain_uncropped = dataset._normalize_terrain(dtm.copy(), effective_pixel_scale=1.0)
+            # Slope is normalized to [0, 1] relative to 90 deg (pi/2)
+            slope_deg = terrain_uncropped[1, 32, 32] * 90.0
+            self.assertAlmostEqual(slope_deg, 30.0, places=2)
+
+            # 2. Cropped physical slope with effective_pixel_scale compensation
+            crop_ratio = 0.8
+            crop_h, crop_w = int(64 * crop_ratio), int(64 * crop_ratio)
+            dtm_cropped = cv2.resize(dtm[:crop_h, :crop_w], (64, 64), interpolation=cv2.INTER_LINEAR)
+
+            # Old buggy way (uncompensated scale)
+            terrain_buggy = dataset._normalize_terrain(dtm_cropped, effective_pixel_scale=1.0)
+            slope_buggy_deg = terrain_buggy[1, 32, 32] * 90.0
+            self.assertLess(slope_buggy_deg, 26.0)  # Underestimates slope!
+
+            # Correct way (compensated effective scale)
+            terrain_compensated = dataset._normalize_terrain(dtm_cropped, effective_pixel_scale=1.0 * crop_ratio)
+            slope_comp_deg = terrain_compensated[1, 32, 32] * 90.0
+            self.assertAlmostEqual(slope_comp_deg, 30.0, delta=0.2)  # Preserves physical slope (<0.1 deg error)!
+
+            # 3. Aspect vector coherence under rotation
+            # Facing East: aspect = 0 rad -> sin=0, cos=1
+            sin_e = terrain_uncropped[2, 32, 32]
+            cos_e = terrain_uncropped[3, 32, 32]
+            self.assertAlmostEqual(sin_e, 0.0, places=2)
+            self.assertAlmostEqual(cos_e, 1.0, places=2)
+
+            # Rotate 90 deg CCW: East becomes North -> aspect = 90 deg -> sin=1, cos=0
+            dtm_rot = np.rot90(dtm, 1).copy()
+            terrain_rot = dataset._normalize_terrain(dtm_rot, effective_pixel_scale=1.0)
+            sin_n = terrain_rot[2, 32, 32]
+            cos_n = terrain_rot[3, 32, 32]
+            self.assertAlmostEqual(sin_n, 1.0, places=2)
+            self.assertAlmostEqual(cos_n, 0.0, places=2)
+
+    def test_raster_alignment_verification_tool(self):
+        """Verify the raster alignment verification tool on real dataset tiles."""
+        from tools.verify_raster_alignment import verify_raster_alignment
+        real_data_dir = Path(__file__).resolve().parent.parent / "dataset" / "dataset_1"
+        if (real_data_dir / "test").exists():
+            res = verify_raster_alignment(data_dir=real_data_dir, split="test", sample_limit=20, verbose=False)
+            self.assertTrue(res["passed"])
+            self.assertEqual(len(res["dimension_mismatches"]), 0)
+            self.assertEqual(len(res["corrupted_files"]), 0)
+    def test_class_weights_excludes_nodata(self):
+        """Verify that calculate_class_weights filters out DTM NoData pixels."""
+        from FusionModelTrain import FusionTrainer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            train_dir = Path(tmpdir) / "train"
+            for sub in ["IMAGE", "DTM", "LABEL"]:
+                (train_dir / sub).mkdir(parents=True)
+
+            # Sample 1: 10x10 image. Half of DTM is NoData (-9999)
+            img = np.zeros((10, 10, 3), dtype=np.uint8)
+            dtm = np.ones((10, 10), dtype=np.float32) * 50.0
+            dtm[:5, :] = -9999.0  # Top half is NoData
+            mask = np.zeros((10, 10), dtype=np.uint8)
+            mask[7:9, 7:9] = 1   # Landslide on valid terrain: 4 pixels
+
+            cv2.imwrite(str(train_dir / "IMAGE" / "tile_001.png"), img)
+            cv2.imwrite(str(train_dir / "DTM" / "tile_001.tif"), dtm)
+            cv2.imwrite(str(train_dir / "LABEL" / "tile_001.png"), mask)
+
+            dataset = LandslideDataset(
+                data_dir=tmpdir,
+                split="train",
+                img_size=(10, 10),
+                is_training=False
+            )
+
+            class DummyConfig:
+                num_classes = 2
+                class_weight_multiplier = 10.0
+                dataset = "landslide"
+
+            class DummyTrainer:
+                def __init__(self, ds):
+                    self.config = DummyConfig()
+                    self.device = torch.device("cpu")
+                    self.train_loader = type("Loader", (), {"dataset": ds})()
+
+            DummyTrainer.calculate_class_weights = FusionTrainer.calculate_class_weights
+
+            trainer = DummyTrainer(dataset)
+            weights = trainer.calculate_class_weights()
+
+            self.assertFalse(torch.isnan(weights).any())
+            self.assertEqual(weights[0].item(), 1.0)
+            self.assertGreater(weights[1].item(), 1.0)
+
+    def test_topographic_normalization_local_relief_and_slope_only(self):
+        """Verify relative local relief and slope-only terrain normalization."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            train_dir = Path(tmpdir) / "train"
+            for sub in ["IMAGE", "DTM", "LABEL"]:
+                (train_dir / sub).mkdir(parents=True)
+
+            img = np.zeros((32, 32, 3), dtype=np.uint8)
+            # Create synthetic elevation ramp: 200m to 300m (delta = 100m)
+            dtm = np.linspace(200.0, 300.0, 32 * 32, dtype=np.float32).reshape(32, 32)
+            mask = np.zeros((32, 32), dtype=np.uint8)
+
+            cv2.imwrite(str(train_dir / "IMAGE" / "t1.png"), img)
+            cv2.imwrite(str(train_dir / "DTM" / "t1.tif"), dtm)
+            cv2.imwrite(str(train_dir / "LABEL" / "t1.png"), mask)
+
+            # 1. Local relief: should map [200, 300] to [0.0, 1.0] exactly
+            ds_relief = LandslideDataset(
+                data_dir=tmpdir,
+                split="train",
+                img_size=(32, 32),
+                dtm_norm="local_relief",
+                is_training=False
+            )
+            _, terrain_relief, _, _ = ds_relief[0]
+            elev_ch = terrain_relief[0].numpy()
+            self.assertAlmostEqual(float(elev_ch.min()), 0.0, places=3)
+            self.assertAlmostEqual(float(elev_ch.max()), 1.0, places=3)
+
+            # 2. Slope only: elevation channel should be zeros, derivatives should be valid
+            ds_slope = LandslideDataset(
+                data_dir=tmpdir,
+                split="train",
+                img_size=(32, 32),
+                dtm_norm="slope_only",
+                include_derivatives=True,
+                is_training=False
+            )
+            _, terrain_slope, _, _ = ds_slope[0]
+            self.assertEqual(terrain_slope.shape[0], 4)  # [DTM, Slope, Sin_Aspect, Cos_Aspect]
+            # Channel 0 (elevation) must be completely zeroed out
+            self.assertEqual(float(terrain_slope[0].abs().max()), 0.0)
+            # Channel 1 (slope) must be non-zero
+            self.assertGreater(float(terrain_slope[1].max()), 0.0)
 
 
 if __name__ == '__main__':
