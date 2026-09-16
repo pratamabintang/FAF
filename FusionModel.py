@@ -410,15 +410,16 @@ class FrequencyAwareFusionModule(nn.Module):
     def forward(self, rgb_feat, ir_feat):
         ir_feat = self.ir_proj(ir_feat)
         
-        # 1. Frequency decomposition (adaptive or fixed)
+        # 1. Frequency decomposition (adaptive SAFD or fixed lowpass)
         if self.use_safd:
             band_weights = self.sigma_predictor(rgb_feat, ir_feat)
             ir_low = self.adaptive_lowpass(ir_feat, band_weights)
         else:
             ir_low = self.lowpass(ir_feat)
-            
+
+        # High-frequency residual (computed unconditionally outside if-else for both branches)
         ir_high = ir_feat - ir_low
-        
+
         # 2. IR Spatial Attention
         mask_low = self.sa_low(ir_low)
         mask_high = self.sa_high(ir_high)
@@ -860,12 +861,14 @@ class NovelFrequencyAwareFusionModule(nn.Module):
     def forward(self, rgb_feat, ir_feat):
         ir_feat = self.ir_proj(ir_feat)
 
-        # 1. Frequency decomposition (adaptive or fixed)
+        # 1. Frequency decomposition (adaptive SAFD or fixed lowpass)
         if self.use_safd:
             band_weights = self.sigma_predictor(rgb_feat, ir_feat)
             ir_low = self.adaptive_lowpass(ir_feat, band_weights)
         else:
             ir_low = self.lowpass(ir_feat)
+
+        # High-frequency residual (computed unconditionally outside if-else for both branches)
         ir_high = ir_feat - ir_low
 
         # 2. Spatial attention on decomposed components
