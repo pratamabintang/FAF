@@ -1596,7 +1596,7 @@ def main():
 
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps.')
     parser.add_argument('--config', type=str, default='',
-                        help='Path to YAML or JSON experiment configuration file (e.g. configs/experiment_config.yaml)')
+                        help='Path to YAML or JSON experiment configuration file (e.g. configs/04_full_proposed_faf.yaml)')
 
     args = parser.parse_args()
     

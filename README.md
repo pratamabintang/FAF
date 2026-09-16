@@ -41,14 +41,14 @@ flowchart TD
         TPSW["Terrain Prior Module (TPSW)<br/>Generates Topographic Prior Map W_terrain"]
     end
 
-    subgraph Encoders["Dual Feature Encoders (e.g. ConvNeXt-V2 / MiT)"]
+    subgraph Encoders["Dual Feature Encoders (e.g. ConvNeXt-V2)"]
         RGB_ENC["Optical Encoder (RGB)<br/>Stages 1 to 4"]
         TER_ENC["Terrain Encoder (DTM)<br/>Stages 1 to 4"]
     end
 
     subgraph FrequencyFusion["Frequency-Aware Multi-Stage Fusion"]
         SAFD["Scene-Adaptive Frequency Decomposition (SAFD)<br/>- Adaptive Gaussian Low-Pass (Context)<br/>- High-Pass Residual: F_high = F - F_low (Contours)<br/>- Frequency-conditioned Attention"]
-        CAFG["Complementarity-Aware Fusion Gate (CAFG)<br/>Dynamic inter-modal gating balancing<br/>optical spectral clues vs terrain morphology"]
+        CAFG["Complementarity-Aware Fusion Gate (CAFG)<br/>Learned cross-modal disagreement routing balancing<br/>optical spectral cues vs terrain morphology"]
     end
 
     subgraph Decoder["Multi-Scale Decoder"]
@@ -85,25 +85,27 @@ flowchart TD
 
 ### 1. Robust Terrain Processing (`LandslideDataset.py`)
 - **True Continuous Elevation:** DTM is loaded and maintained in unquantized `float32` representation rather than compressed 8-bit integers.
-- **Physical Topographic Derivatives:** Topographic gradient calculation incorporates physical ground resolution (`pixel_scale` in meters/pixel). Aspect is parameterized continuously as $\sin(\text{aspect})$ and $\cos(\text{aspect})$ (flat terrain mapped to $(0, 0)$) to eliminate the $0^\circ \leftrightarrow 360^\circ$ circular discontinuity.
+- **Physical Topographic Derivatives:** Topographic gradient calculation incorporates physical ground resolution (`pixel_scale` in meters/pixel). Aspect is parameterized continuously as $\sin(\text{aspect})$ and $\cos(\text{aspect})$ (flat terrain mapped to $(0, 0)$) to eliminate circular discontinuities.
 - **NoData Integrity:** Unmeasured / NoData elevation pixels are imputed with local median to prevent NaN-bleeding, while corresponding ground-truth pixels are marked with `ignore_index = -100` so they never corrupt training loss.
 - **Positive-Aware Sampling:** Landslide scars typically constitute only 1–3% of regional pixels. The dataset loader provides balanced positive patch cropping and optional `WeightedRandomSampler` (`positive_aware_sampler`) ensuring training batches consistently encounter active landslide foreground.
 
 ### 2. Terrain-Aware Architectural Formulation (`FusionModel.py`)
-- **Topographic Prior Module (`TerrainPriorModule` / TPSW):** Computes continuous terrain weights based on elevation and slope gradients, selectively accentuating optical features on prone slope geometries.
-- **SAFD Decomposition Fix:** Proper residual split ($F_{high} = F - F_{low}$) guarantees that high-frequency structural contours are always defined and processed by the spatial-frequency attention mechanism.
-- **Dynamic Channel Adaptation:** Encoders dynamically support either single-channel elevation inputs ($C=1$) or 4-channel terrain feature packs ($C=4$: DTM, Slope, $\sin(\text{Aspect})$, $\cos(\text{Aspect})$).
+- **Topographic Prior Module (`TerrainPriorModule` / TPSW):** Computes continuous terrain weights based on elevation and slope gradients with centered bidirectional modulation ($f \times (0.5 + tp)$).
+- **SAFD Decomposition:** Clear residual split ($F_{\text{high}} = F - F_{\text{low}}$) guarantees high-frequency structural contours are unconditionally defined and processed by the spatial-frequency attention mechanism.
+- **Complementarity-Aware Fusion Gate (CAFG):** Uses cosine distance in a learned bottleneck projection ($d_{\cos} = 1 - \langle \hat{f}_{\text{rgb}}, \hat{f}_{\text{terrain}} \rangle$) as a dynamic routing signal across modalities.
+- **Decoupled Unimodal Baselines:** Standalone `rgb_only` and `dtm_only` modes instantiate only the active backbone encoder, eliminating memory, FLOPs, and parameter inflation when establishing unimodal baselines. Supports heterogeneous backbone combinations (e.g. RGB Nano + DTM Tiny) through dynamic decoder channel routing.
 
 ### 3. Stabilized Objective & Metrics (`FusionModelTrain.py`)
 - **Normalized Weighted Dice:** Class-weighted Dice is mathematically normalized by the sum of weights, preventing negative loss values when class weights exceed 1.0.
+- **Fail-Fast Class Weights:** Computes class weights directly from training split foreground frequencies with fail-fast assertions for zero-landslide edge cases.
 - **Target-Aware OHEM:** Online hard example mining evaluates mispredictions against true class assignments rather than unconditioned maximum prediction probabilities.
-- **True Cosine Annealing:** Replaced ad-hoc exponential decay with standard Cosine Annealing with warmup (`torch.optim.lr_scheduler.CosineAnnealingLR`).
+- **True Cosine Annealing:** Standard Cosine Annealing with warmup (`torch.optim.lr_scheduler.CosineAnnealingLR`).
 - **Landslide-Centric Validation:** Best checkpoint selection tracks **Landslide IoU** (Class 1) and F1-Score rather than overall mIoU, which is overwhelmed by background (>98%).
 
 ### 4. Config-Driven & Safe Inference (`FusionModelRunDemo.py`, `FusionModelUtils.py`)
-- **Dynamic Checkpoint Loading:** Model architecture (`rgb_arch`, `ir_arch`, `num_classes`, `decoder_type`, `deep_supervision`, `novel_fusion`) is dynamically reconstructed from the checkpoint's saved `config` dictionary with strict state verification (`strict=True`).
+- **Dynamic Checkpoint Loading:** Model architecture (`rgb_arch`, `ir_arch`, `num_classes`, `decoder_type`, `deep_supervision`, `novel_fusion`) is dynamically reconstructed from the checkpoint's saved configuration metadata with strict state verification (`strict=True`).
 - **Correct ImageNet RGB Denormalization:** Ensures visualization grids render clear, undistorted aerial imagery.
-- **Isolated Visualizations:** Output artifacts are written safely to `runs/demo_results/` without destructive folder deletions.
+- **Side-by-Side Diagnostics:** Output artifacts are written safely to `runs/demo_results/` displaying RGB, DTM, Ground Truth, and Prediction Overlay.
 
 ---
 
@@ -111,28 +113,40 @@ flowchart TD
 
 ```text
 FAF(FrequencyAwareFusion)/
-├── configs/
-│   └── experiment_config.yaml     # Central reproducible training configuration
-├── legacy/                         # Isolated legacy RGB-Thermal components
+├── configs/                       # Staged YAML experiment configurations (15 configurations)
+│   ├── 01_baseline_vanilla.yaml   # FPN baseline
+│   ├── 01b_baseline_panet.yaml    # PANet baseline
+│   ├── 01c_baseline_panet_deepsup.yaml
+│   ├── 02a_ablation_safd.yaml     # Ablation: SAFD only
+│   ├── 02b_ablation_cafg.yaml     # Ablation: CAFG only
+│   ├── 02c_ablation_tpsw.yaml     # Ablation: TPSW only
+│   ├── 03a_combo_safd_cafg.yaml   # Combination: SAFD + CAFG
+│   ├── 03b_combo_safd_tpsw.yaml   # Combination: SAFD + TPSW
+│   ├── 03c_combo_cafg_tpsw.yaml   # Combination: CAFG + TPSW
+│   ├── 04_full_proposed_faf.yaml  # Full proposed method: SAFD + CAFG + TPSW + PANet
+│   ├── 05_full_faf_4channel.yaml  # 4-channel terrain (DTM, Slope, Aspect)
+│   ├── 06_full_faf_ohem_boundary.yaml # OHEM + Boundary loss
+│   ├── 07_baseline_rgb_only.yaml  # Decoupled unimodal RGB baseline
+│   ├── 08_baseline_dtm_only.yaml  # Decoupled unimodal DTM baseline
+│   └── 09_ablation_local_relief.yaml # Relative local relief normalization
+├── tools/
+│   └── verify_raster_alignment.py # Raster spatial compatibility & GeoTIFF verification tool
+├── legacy/                        # Isolated legacy RGB-Thermal components
 │   ├── FusionModelDataset.py      # MFNet dataset loader (legacy)
 │   ├── PST900Dataset.py           # PST900 dataset loader (legacy)
 │   └── tent.py                    # Test-time adaptation (legacy)
-├── docs/
-│   └── audit_remediation_reference.md  # Comprehensive technical audit log
-├── tests/
+├── docs/                          # Architecture records & domain guidelines
+├── tests/                         # Comprehensive automated unit test suite
 │   ├── test_landslide_dataset.py  # DTM, derivatives, NoData, sampling unit tests
-│   ├── test_model.py              # SAFD, CAFG, TPSW, PANet, loss unit tests
+│   ├── test_model.py              # SAFD, CAFG, TPSW, PANet, decoupled unimodal tests
 │   └── test_inference_and_utils.py# Strict loading, denormalization, metric tests
-├── FusionModel.py                 # Core multimodal network & fusion modules
+├── FusionModel.py                 # Core multimodal network & novel fusion modules
 ├── LandslideDataset.py            # Multimodal RGB + DTM dataset loader
 ├── FusionModelTrain.py            # Training loop, evaluation, and checkpointing
 ├── FusionModelRunDemo.py          # Inference evaluation & diagnostic visualizer
-├── FusionModelUtils.py            # Metrics (mIoU, F1), color palettes, plotting
-├── environment-gpu.yml            # Conda environment definition (CUDA 12.1)
-├── environment-cpu.yml            # Conda environment definition (CPU only)
+├── FusionModelUtils.py            # Metrics (IoU, F1), color palettes, plotting
 ├── requirements.txt               # Pip dependency specification
-├── run_tests.py                   # Automated test suite runner
-├── smoke_test.py                  # Forward/backward training smoke test
+├── smoke_test.py                  # End-to-end model smoke test
 └── LICENSE                        # MIT License & attribution notice
 ```
 
@@ -140,34 +154,40 @@ FAF(FrequencyAwareFusion)/
 
 ## 🛠️ Environment Setup & Installation
 
-### Option A: Conda GPU Environment (Recommended for NVIDIA RTX GPU / CUDA 12.1+)
+The repository uses standard Python virtual environments (`venv`) and `pip`. **No Conda environment files are required.**
+
+### 1. Create and Activate Virtual Environment
+
+**On Windows (PowerShell):**
 ```powershell
-# Create Conda environment
-conda env create -f environment-gpu.yml
-
-# Activate environment
-conda activate faf-landslide
-```
-
-### Option B: Conda CPU Environment (For development without discrete GPU)
-```powershell
-# Create CPU environment
-conda env create -f environment-cpu.yml
-
-# Activate environment
-conda activate faf-landslide-cpu
-```
-
-### Option C: Standard Pip Installation
-```powershell
-# Create and activate virtual environment
 python -m venv .venv
 .\.venv\Scripts\activate
+```
 
-# Install PyTorch with CUDA 12.1
+**On Linux / macOS:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. Install PyTorch
+
+Install the PyTorch build that matches your hardware:
+
+**For NVIDIA GPU with CUDA 12.1+ (e.g. RTX 2060 Super):**
+```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
 
-# Install repository dependencies
+**For CPU-Only Development:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+### 3. Install Repository Dependencies
+
+Install all remaining dependencies directly via `requirements.txt`:
+```bash
 pip install -r requirements.txt
 ```
 
@@ -202,34 +222,54 @@ dataset/dataset_1/
 
 ## 🧪 Verification & Sanity Checks
 
-Before launching experiments, verify all components using the built-in test suite:
+Before launching long training runs, verify raster integrity, model execution, and unit tests:
 
-```powershell
-# Run the complete unit test suite (32 tests)
-python run_tests.py
+### 1. Verify Raster Spatial Compatibility & Georeferencing
+Validate image dimensions, channel reduction, and NoData values across all modalities:
+```bash
+python tools/verify_raster_alignment.py --data_dir dataset/dataset_1 --split test --sample_limit 20
+```
+*(If `rasterio` is installed, it also automatically verifies GeoTIFF CRS, affine transforms, and geographic bounds).*
 
-# Run a synthetic multimodal forward & backward pass smoke test
-python smoke_test.py
+### 2. Run Smoke Test Suite
+Perform an offline forward and backward pass on any YAML configuration:
+```bash
+# Test full proposed architecture (offline, CPU or GPU)
+python smoke_test.py --config_path configs/04_full_proposed_faf.yaml --device cpu --img_height 64 --img_width 64
+
+# Test all YAML configurations
+python smoke_test.py --yaml_configs --device cpu --img_height 64 --img_width 64
 ```
 
-Expected output:
-```text
-[TEST SUITE SUCCESS] Passed all 32 unit test cases.
-[SMOKE TEST SUCCESS] Multimodal forward and backward steps executed without errors.
+### 3. Run Unit Test Suite
+Execute the comprehensive automated test suite:
+```bash
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ---
 
 ## 🚀 Training Workflow
 
-### 1. Training with Reproducible Configuration (Recommended)
-All hyperparameters, data paths, loss settings, and architectural options are centralized in `configs/experiment_config.yaml`:
+### 1. Training with Staged Experiment Configurations (Recommended)
+All hyperparameters, data paths, loss settings, and architectural options are organized into reproducible YAML configs under `configs/`:
 
-```powershell
-python FusionModelTrain.py --config configs/experiment_config.yaml
+```bash
+# Proposed Full Architecture (SAFD + CAFG + TPSW + PANet)
+python FusionModelTrain.py --config configs/04_full_proposed_faf.yaml
+
+# Baseline Vanilla FPN
+python FusionModelTrain.py --config configs/01_baseline_vanilla.yaml
+
+# Unimodal RGB-Only Baseline
+python FusionModelTrain.py --config configs/07_baseline_rgb_only.yaml
+
+# Unimodal DTM-Only Baseline
+python FusionModelTrain.py --config configs/08_baseline_dtm_only.yaml
 ```
 
 ### 2. Training with Command-Line Overrides
+You can override any parameter directly from the command line:
 ```powershell
 python FusionModelTrain.py `
     --dataset landslide `
@@ -237,12 +277,15 @@ python FusionModelTrain.py `
     --img_height 512 `
     --img_width 512 `
     --batch_size 4 `
-    --grad_accum_steps 2 `
+    --grad_accum_steps 1 `
     --epochs 300 `
     --rgb_arch convnextv2_tiny.fcmae_ft_in22k_in1k_384 `
     --ir_arch convnextv2_tiny.fcmae_ft_in22k_in1k_384 `
     --decoder_type panet `
     --deep_supervision `
+    --use_safd `
+    --use_cafg `
+    --use_tpsw `
     --loss_type combo3 `
     --class_weights `
     --positive_aware_sampling
@@ -251,26 +294,29 @@ python FusionModelTrain.py `
 ### Key Training Options
 | Argument | Default | Description |
 | :--- | :--- | :--- |
-| `--config` | `None` | Path to YAML configuration file |
-| `--loss_type` | `combo3` | Loss function (`combo3` = Weighted CE + Dice; `combo_ohem` = CE + Dice + OHEM + Boundary) |
+| `--config` | `None` | Path to YAML configuration file (e.g. `configs/04_full_proposed_faf.yaml`) |
+| `--loss_type` | `combo3` | Loss function (`combo3` = Weighted CE + Dice + Lovasz; `combo_ohem` = Combo + OHEM + Boundary) |
 | `--include_derivatives` | `False` | Computes 4-channel terrain input `[DTM, Slope, Sin(Aspect), Cos(Aspect)]` |
 | `--pixel_scale` | `1.0` | Physical ground resolution (meters/pixel) for accurate gradient calculation |
 | `--positive_aware_sampling` | `False` | Ensures random crops center on landslide foreground pixels |
 | `--decoder_type` | `panet` | Decoder architecture: `panet` (recommended) or `fpn` |
 | `--deep_supervision` | `False` | Multi-stage auxiliary supervision during training |
+| `--use_safd` | `False` | Enables Scene-Adaptive Frequency Decomposition |
+| `--use_cafg` | `False` | Enables Complementarity-Aware Fusion Gate |
+| `--use_tpsw` | `False` | Enables Topographic Prior-Guided Spatial Weighting |
 
 ---
 
 ## 📊 Inference, Evaluation & Visualization
 
-Evaluate the model checkpoint on the test split and generate side-by-side diagnostic visualization panels:
+Evaluate a saved checkpoint on the test split and generate side-by-side diagnostic visualization panels:
 
 ```powershell
 python FusionModelRunDemo.py `
     --dataset landslide `
     --data_dir ./dataset/dataset_1 `
     --dataset_split test `
-    --model_dir Experiments/faf_landslide_experiment_v1 `
+    --model_dir Experiments/04_full_proposed_faf `
     --weight_name checkpoints `
     --file_name best_model.ema.pth `
     --visualize
@@ -279,10 +325,10 @@ python FusionModelRunDemo.py `
 > **Note:** `FusionModelRunDemo.py` automatically reads the exact backbone architecture, decoder type, and fusion parameters directly from the checkpoint's embedded configuration metadata, guaranteeing full evaluation fidelity without manual CLI flags.
 
 ### Visualization Output (`runs/demo_results/`)
-The visualizer exports diagnostic composite images containing:
+The visualizer exports composite diagnostic images containing:
 1. **RGB Optical:** ImageNet-denormalized true-color optical frame.
 2. **DTM Elevation:** Colormapped topographic terrain elevation.
-3. **Ground Truth:** True segmentation mask (Black = Background, Red = Landslide).
+3. **Ground Truth:** True segmentation mask (Black = Background, Vivid Red = Landslide).
 4. **Model Prediction:** Model classification overlay on the optical image.
 
 ---
