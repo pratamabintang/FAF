@@ -1,0 +1,53 @@
+MIT License
+
+Copyright (c) 2024-2026 Frequency-Aware Fusion (FAF) Contributors & Ananda Bintang Pratama
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+### Upstream Attribution & Modification Notice
+
+This repository is derived from and builds upon the Frequency-Aware Fusion (FAF)
+architecture originally developed for multimodal semantic segmentation (RGB-Thermal
+benchmarks including MFNet and PST900).
+
+#### Summary of Major Extensions & Re-engineering for Landslide Detection:
+1. **Terrain-Aware Continuous Elevation Processing (`LandslideDataset.py`):**
+   - True `float32` unquantized Digital Terrain Model (DTM) processing.
+   - Physical scale topographic gradient derivation (Slope and continuous $\sin/\cos$ Aspect parameterization).
+   - Median imputation with ground truth `ignore_index = -100` invalid pixel masking.
+   - Positive-aware patch sampling and balanced foreground sampling for extreme class imbalance (~2% landslide pixels).
+2. **Terrain-Aware Architectural Adaptation (`FusionModel.py`):**
+   - Added `TerrainPriorModule` (TPSW) tailored for topographic features and slope modulation.
+   - Multi-channel terrain backbone support (1-channel DTM or 4-channel DTM + topographic derivatives).
+   - Re-parameterized confidence gating and complementarity-aware fusion gates (CAFG) for optical-topographic complementarity.
+   - Fixed high-frequency SAFD decomposition (`ir_high = ir_feat - ir_low`).
+3. **Loss Function Stabilization & Alignment (`FusionModelTrain.py`):**
+   - Corrected weighted multiclass Dice normalization to prevent negative loss values.
+   - Bounded boundary probability formulation with Binary Cross Entropy.
+   - Target-class-focused Online Hard Example Mining (OHEM).
+   - Standard Cosine Annealing learning rate schedule with warmup.
+4. **Synchronized Inference & Verification (`FusionModelRunDemo.py`):**
+   - Dynamic model reconstruction from checkpoint configuration dictionaries.
+   - Strict state dict loading (`strict=True`).
+   - ImageNet RGB denormalization fix and isolated visualization outputs (`runs/demo_results/`).
+   - Per-class metric tracking (Landslide IoU and F1-score).
+5. **Legacy Benchmark Isolation:**
+   - Isolated historical RGB-Thermal datasets (MFNet, PST900) and test-time adaptation (tent) into `legacy/` package with backward-compatible forwarding shims.

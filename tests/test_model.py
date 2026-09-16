@@ -196,6 +196,58 @@ class TestModelArchitecture(unittest.TestCase):
         # Verify update happened
         self.assertGreater((after - before).abs().sum().item(), 0.0)
 
+    def test_loss_functions_stability(self):
+        """Verify BoundaryLoss, OHEMCrossEntropyLoss, and ComboLoss3 are finite and non-negative."""
+        from FusionModelTrain import BoundaryLoss, OHEMCrossEntropyLoss, ComboLoss3
+
+        B, C, H, W = 2, 2, 32, 32
+        logits = torch.randn(B, C, H, W, requires_grad=True)
+        targets = torch.randint(0, C, (B, H, W), dtype=torch.long)
+
+        # 1. BoundaryLoss
+        boundary_loss = BoundaryLoss(num_classes=C)
+        b_loss = boundary_loss(logits, targets)
+        self.assertFalse(torch.isnan(b_loss))
+        self.assertFalse(torch.isinf(b_loss))
+        self.assertGreaterEqual(b_loss.item(), 0.0)
+
+        # 2. OHEMCrossEntropyLoss
+        ohem_loss = OHEMCrossEntropyLoss(min_kept=10, thresh=0.7)
+        o_loss = ohem_loss(logits, targets)
+        self.assertFalse(torch.isnan(o_loss))
+        self.assertFalse(torch.isinf(o_loss))
+        self.assertGreaterEqual(o_loss.item(), 0.0)
+
+        # 3. ComboLoss3 with high class weights (e.g. 50.0 for rare class)
+        class_weights = torch.tensor([1.0, 50.0])
+        combo3 = ComboLoss3(ce_w=0.5, dice_w=0.5, lovasz_w=0.0, class_weights=class_weights)
+        c_loss = combo3(logits, targets)
+        self.assertFalse(torch.isnan(c_loss))
+        self.assertFalse(torch.isinf(c_loss))
+        self.assertGreaterEqual(c_loss.item(), 0.0)
+
+    def test_dynamic_in_chans_adaptation(self):
+        """Verify FusionModel initializes and runs forward pass with 4-channel terrain input."""
+        res = (64, 64)
+        model = FusionModel(
+            rgb_arch='convnextv2_nano.fcmae_ft_in22k_in1k_384',
+            ir_arch='convnextv2_nano.fcmae_ft_in22k_in1k_384',
+            num_classes=2,
+            context_dim=[80, 160, 320, 640],
+            input_resolution=res,
+            rgb_backbone_resolution=res,
+            ir_backbone_resolution=res,
+            output_resolution=res,
+            ir_in_chans=4,
+            use_tpsw=True
+        )
+        rgb = torch.randn(2, 3, 64, 64)
+        terrain = torch.randn(2, 4, 64, 64)
+        main_out, _ = model(rgb, terrain)
+        self.assertEqual(main_out.shape, torch.Size([2, 2, 64, 64]))
+        self.assertFalse(torch.isnan(main_out).any())
+
 
 if __name__ == '__main__':
     unittest.main()
+

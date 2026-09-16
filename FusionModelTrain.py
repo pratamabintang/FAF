@@ -151,8 +151,9 @@ class FocalLoss(nn.Module):
 
 class ComboLoss3(nn.Module):
     def __init__(self, ce_w=0.6, dice_w=0.2, lovasz_w=0.2,
-                 class_weights=None, ignore_index=None, label_smoothing=0.05):
+                 class_weights=None, ignore_index=-100, label_smoothing=0.05):
         super().__init__()
+        ignore_index = -100 if ignore_index is None else ignore_index
         self.ce = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ignore_index, label_smoothing=label_smoothing)
         self.ce_w, self.dice_w, self.lovasz_w = ce_w, dice_w, lovasz_w
 
@@ -168,13 +169,18 @@ class ComboLoss3(nn.Module):
             inter = (p_fg * y_fg).sum(dim=(1, 2))
             union = p_fg.sum(dim=(1, 2)) + y_fg.sum(dim=(1, 2))
             dice = (2.0 * inter + eps) / (union + eps)
-            return 1.0 - dice.mean()
+            return (1.0 - dice).clamp(min=0.0, max=1.0).mean()
         
-        y1h = F.one_hot(y.clamp_min(0), C).permute(0,3,1,2).float()
-        inter = (probs * y1h).sum(dim=(0,2,3))
-        union = probs.sum(dim=(0,2,3)) + y1h.sum(dim=(0,2,3))
-        dice = (2*inter + eps) / (union + eps)
-        return 1.0 - dice.mean()
+        y1h = F.one_hot(y.clamp(min=0, max=C-1), C).permute(0, 3, 1, 2).float()
+        inter = (probs * y1h).sum(dim=(0, 2, 3))
+        union = probs.sum(dim=(0, 2, 3)) + y1h.sum(dim=(0, 2, 3))
+        dice_per_class = (2.0 * inter + eps) / (union + eps)
+        
+        weights = getattr(self.ce, 'weight', None)
+        if weights is not None:
+            weights = weights.to(dice_per_class.device)
+            return (((1.0 - dice_per_class).clamp(min=0.0, max=1.0)) * weights).sum() / (weights.sum() + eps)
+        return (1.0 - dice_per_class).clamp(min=0.0, max=1.0).mean()
 
     def forward(self, logits, y):
         logits = logits.float()
@@ -209,12 +215,12 @@ class OHEMCrossEntropyLoss(nn.Module):
         num_pixels = loss_flat.numel()
         min_kept = min(self.min_kept, num_pixels)
         
-        # Fast GPU selection without CPU synchronization
+        # Select hard pixels based on target class confidence (low confidence on ground truth)
         probs = torch.softmax(logits, dim=1)
-        max_probs, _ = probs.max(dim=1)
-        max_probs_flat = max_probs.view(-1)[valid_mask]
+        target_probs = probs.gather(1, targets.clamp(0, logits.shape[1] - 1).unsqueeze(1)).squeeze(1)
+        target_probs_flat = target_probs.view(-1)[valid_mask]
         
-        hard_mask = max_probs_flat < self.thresh
+        hard_mask = target_probs_flat < self.thresh
         if hard_mask.any():
             hard_loss = loss_flat[hard_mask]
             if hard_loss.numel() >= min_kept:
@@ -260,12 +266,12 @@ class BoundaryLoss(nn.Module):
         probs = torch.softmax(logits, dim=1)
         weight = self.laplacian.to(probs.device).expand(self.num_classes, 1, 3, 3)
         edges = F.conv2d(probs, weight, padding=1, groups=self.num_classes)
-        pred_boundary = edges.abs().max(dim=1)[0] * 5.0
+        pred_boundary = torch.clamp(edges.abs().max(dim=1)[0], 0.0, 1.0)
         
         valid_mask = (targets != self.ignore_index).float()
         boundary_weight = 1.0 + 2.0 * gt_boundary
         
-        loss = F.binary_cross_entropy_with_logits(
+        loss = F.binary_cross_entropy(
             pred_boundary,
             gt_boundary,
             weight=boundary_weight * valid_mask,
@@ -324,13 +330,18 @@ class ComboLossOHEM(nn.Module):
             inter = (p_fg * y_fg).sum(dim=(1, 2))
             union = p_fg.sum(dim=(1, 2)) + y_fg.sum(dim=(1, 2))
             dice = (2.0 * inter + eps) / (union + eps)
-            return 1.0 - dice.mean()
+            return (1.0 - dice).clamp(min=0.0, max=1.0).mean()
         
-        y1h = F.one_hot(y.clamp_min(0), C).permute(0,3,1,2).float()
-        inter = (probs * y1h).sum(dim=(0,2,3))
-        union = probs.sum(dim=(0,2,3)) + y1h.sum(dim=(0,2,3))
-        dice = (2*inter + eps) / (union + eps)
-        return 1.0 - dice.mean()
+        y1h = F.one_hot(y.clamp(min=0, max=C-1), C).permute(0, 3, 1, 2).float()
+        inter = (probs * y1h).sum(dim=(0, 2, 3))
+        union = probs.sum(dim=(0, 2, 3)) + y1h.sum(dim=(0, 2, 3))
+        dice_per_class = (2.0 * inter + eps) / (union + eps)
+        
+        weights = getattr(self.ce, 'weight', None)
+        if weights is not None:
+            weights = weights.to(dice_per_class.device)
+            return (((1.0 - dice_per_class).clamp(min=0.0, max=1.0)) * weights).sum() / (weights.sum() + eps)
+        return (1.0 - dice_per_class).clamp(min=0.0, max=1.0).mean()
     
     def forward(self, logits, y):
         logits = logits.float()
@@ -391,6 +402,7 @@ class FusionTrainer:
         # Training state
         self.start_epoch = 1
         self.best_miou = 0.0
+        self.best_landslide_iou = 0.0
         self.best_loss = float('inf')
         
         # Load checkpoint if resuming
@@ -406,8 +418,14 @@ class FusionTrainer:
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+        is_deterministic = getattr(self.config, 'deterministic', False)
+        use_benchmark = getattr(self.config, 'benchmark', not is_deterministic)
+        torch.backends.cudnn.deterministic = is_deterministic
+        torch.backends.cudnn.benchmark = use_benchmark
+        if is_deterministic:
+            print(f"[REPRODUCIBILITY] Seed={seed} | CUDNN Deterministic=True | Benchmark=False")
+        else:
+            print(f"[THROUGHPUT] Seed={seed} | CUDNN Benchmark=True | Deterministic=False")
     
     def setup_directories(self):
         """Create necessary directories"""
@@ -441,6 +459,9 @@ class FusionTrainer:
         use_safd = getattr(self.config, 'use_safd', False)
         use_cafg = getattr(self.config, 'use_cafg', False)
         use_tpsw = getattr(self.config, 'use_tpsw', False)
+        include_derivatives = getattr(self.config, 'include_derivatives', False)
+        ir_in_chans = 4 if include_derivatives else getattr(self.config, 'ir_in_chans', 1)
+        self.config.ir_in_chans = ir_in_chans
         
         model = FusionModel(
             rgb_arch=self.config.rgb_arch,
@@ -456,7 +477,8 @@ class FusionTrainer:
             enhanced_fusion=enhanced_fusion,
             use_safd=use_safd,
             use_cafg=use_cafg,
-            use_tpsw=use_tpsw
+            use_tpsw=use_tpsw,
+            ir_in_chans=ir_in_chans
         )
         
         model = model.to(self.device)
@@ -512,6 +534,12 @@ class FusionTrainer:
             dtm_norm = getattr(self.config, 'dtm_norm', 'standard')
             dtm_mean = getattr(self.config, 'dtm_mean', 72.82)
             dtm_std = getattr(self.config, 'dtm_std', 58.01)
+            include_derivatives = getattr(self.config, 'include_derivatives', False)
+            pixel_scale = getattr(self.config, 'pixel_scale', 1.0)
+            ignore_nodata = getattr(self.config, 'ignore_nodata', True)
+            positive_aware_sampling = getattr(self.config, 'positive_aware_sampling', True)
+            positive_sample_prob = getattr(self.config, 'positive_sample_prob', 0.5)
+
             train_dataset = LandslideDataset(
                 data_dir=self.config.data_root,
                 split="train",
@@ -519,7 +547,12 @@ class FusionTrainer:
                 is_training=True,
                 dtm_norm=dtm_norm,
                 dtm_mean=dtm_mean,
-                dtm_std=dtm_std
+                dtm_std=dtm_std,
+                include_derivatives=include_derivatives,
+                pixel_scale=pixel_scale,
+                ignore_nodata=ignore_nodata,
+                positive_aware_sampling=positive_aware_sampling,
+                positive_sample_prob=positive_sample_prob
             )
             val_split = "val" if os.path.exists(os.path.join(self.config.data_root, "val")) else "test"
             val_dataset = LandslideDataset(
@@ -529,7 +562,10 @@ class FusionTrainer:
                 is_training=False,
                 dtm_norm=dtm_norm,
                 dtm_mean=dtm_mean,
-                dtm_std=dtm_std
+                dtm_std=dtm_std,
+                include_derivatives=include_derivatives,
+                pixel_scale=pixel_scale,
+                ignore_nodata=ignore_nodata
             )
         else:
             raise ValueError(f"Unknown dataset: {self.config.dataset}. Choose 'landslide', 'mfnet', or 'pst900'.")
@@ -537,11 +573,35 @@ class FusionTrainer:
         use_persistent = self.config.num_workers > 0
         prefetch = 2 if self.config.num_workers > 0 else None
         
+        # Check if positive-aware weighted sampler is enabled
+        use_sampler = getattr(self.config, 'positive_aware_sampler', False) and self.config.dataset == 'landslide'
+        sampler = None
+        shuffle = True
+        if use_sampler:
+            print("[INFO] Computing sample weights for positive-aware WeightedRandomSampler...")
+            sample_weights = []
+            for s in train_dataset.samples:
+                lbl_path = s.get("lbl_path")
+                if lbl_path and os.path.exists(lbl_path):
+                    raw_mask = train_dataset._read_mask(lbl_path)
+                    has_pos = bool((raw_mask == 1).any())
+                    sample_weights.append(5.0 if has_pos else 1.0)
+                else:
+                    sample_weights.append(1.0)
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(train_dataset),
+                replacement=True
+            )
+            shuffle = False
+            print(f"[INFO] Positive-aware WeightedRandomSampler configured ({sum(w > 1.0 for w in sample_weights)}/{len(sample_weights)} positive samples prioritized).")
+
         # Create loaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.config.num_workers,
             pin_memory=torch.cuda.is_available(),
             drop_last=True,
@@ -630,14 +690,27 @@ class FusionTrainer:
         return criterion_main, criterion_aux
     
     def calculate_class_weights(self):
-        print("Calculating class weights...")
+        print("Calculating class weights directly from raw training labels...")
         class_counts = torch.zeros(self.config.num_classes, device=self.device)
 
-        for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
-            mask = mask.to(self.device)
-            valid = (mask >= 0) & (mask < self.config.num_classes)
-            mask = mask[valid]
-            class_counts += torch.bincount(mask, minlength=self.config.num_classes)
+        dataset = self.train_loader.dataset
+        if hasattr(dataset, "samples") and len(dataset.samples) > 0:
+            for s in tqdm(dataset.samples, desc="Computing class weights (raw labels)"):
+                lbl_path = s.get("lbl_path")
+                if lbl_path and os.path.exists(lbl_path):
+                    raw_mask = cv2.imread(str(lbl_path), cv2.IMREAD_UNCHANGED)
+                    if raw_mask is not None:
+                        if raw_mask.ndim == 3:
+                            raw_mask = raw_mask[:, :, 0]
+                        # Map to integer class (0=BG, 1=Landslide)
+                        cls_mask = torch.from_numpy(((raw_mask == 1) | (raw_mask == 65535)).astype(np.int64))
+                        valid = (cls_mask >= 0) & (cls_mask < self.config.num_classes)
+                        class_counts += torch.bincount(cls_mask[valid].to(self.device), minlength=self.config.num_classes)
+        else:
+            for _, _, mask, _ in tqdm(self.train_loader, desc="Computing class weights"):
+                mask = mask.to(self.device)
+                valid = (mask >= 0) & (mask < self.config.num_classes)
+                class_counts += torch.bincount(mask[valid], minlength=self.config.num_classes)
 
         freq = class_counts / class_counts.sum()
 
@@ -771,16 +844,16 @@ class FusionTrainer:
                 gamma=0.5
             )
         elif self.config.scheduler == 'cosine_warmup':
-            warmup_epochs = self.config.warmup_epochs
-            flat_epochs = self.config.flat_epochs
+            warmup_epochs = max(1, getattr(self.config, 'warmup_epochs', 10))
+            total_epochs = max(warmup_epochs + 1, self.config.epochs)
+            min_lr_ratio = 1e-3
 
             def lr_lambda(epoch):
                 if epoch < warmup_epochs:
-                    return epoch / warmup_epochs
-                elif epoch < warmup_epochs + flat_epochs:
-                    return 1.0
+                    return float(epoch + 1) / float(warmup_epochs)
                 else:
-                    return 0.5 ** ((epoch - warmup_epochs - flat_epochs) / 15)
+                    progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+                    return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         
@@ -854,16 +927,14 @@ class FusionTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (rgb, ir, masks,_) in enumerate(pbar):
-            # Forward pass
-            if masks.max() >= self.config.num_classes:
-                print(f"\nWarning: Found invalid labels in batch {batch_idx}")
-                print(f"Label range before clamping: min={masks.min()}, max={masks.max()}")
-                # Print samples with invalid labels
-                invalid_mask = masks >= self.config.num_classes
-
-                max_label = self.config.num_classes - 1
-                masks = masks.clamp_(0, max_label)
-                print(f"Labels clamped to range [0, {max_label}]")
+            # Fail-fast validation on label values instead of silent clamping
+            valid_mask_values = (masks >= 0) & (masks < self.config.num_classes)
+            if not valid_mask_values.all():
+                invalid_vals = torch.unique(masks[~valid_mask_values]).tolist()
+                raise ValueError(
+                    f"Unexpected label values found in batch {batch_idx}: {invalid_vals}. "
+                    f"Expected classes in [0, {self.config.num_classes - 1}]."
+                )
 
             rgb = rgb.to(device=self.device)
             ir = ir.to(device=self.device)
@@ -903,8 +974,9 @@ class FusionTrainer:
             # Backward
             self.scaler.scale(loss).backward()
             
-            # Update weights every accumulation_steps
-            if (batch_idx + 1) % accumulation_steps == 0:
+            # Update weights every accumulation_steps or on the last batch of the epoch
+            is_last_batch = (batch_idx + 1 == len(self.train_loader))
+            if ((batch_idx + 1) % accumulation_steps == 0) or is_last_batch:
                 # Gradient clipping
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
@@ -918,7 +990,7 @@ class FusionTrainer:
                 self.scaler.update()
                 self.optimizer.zero_grad()
 
-                # EMA güncelle
+                # EMA update only when optimizer actually steps
                 if self.ema is not None:
                     self.ema.update(self.model)
             
@@ -1007,6 +1079,7 @@ class FusionTrainer:
             "scaler_state_dict": self.scaler.state_dict() if getattr(self, "scaler", None) else None,
             "ema_state_dict": (self.ema.state_dict() if hasattr(self, "ema") and self.ema is not None else None),
             "best_miou": float(getattr(self, "best_miou", 0.0)),
+            "best_landslide_iou": float(getattr(self, "best_landslide_iou", 0.0)),
             "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
         }
 
@@ -1039,9 +1112,13 @@ class FusionTrainer:
                     "epoch": epoch,
                     "model_state_dict": full_state,
                     "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
-                    "best_miou": float(self.best_miou)
+                    "best_miou": float(self.best_miou),
+                    "best_landslide_iou": float(self.best_landslide_iou)
                 }, self.checkpoint_dir / "best_model.ema.pth")
-                print(f"[INFO] New best mIoU: {self.best_miou:.4f} | Saved best.pth and best_model.ema.pth")
+                if self.config.dataset == 'landslide' or self.config.num_classes == 2:
+                    print(f"[INFO] New best Landslide IoU: {self.best_landslide_iou:.4f} (mIoU: {self.best_miou:.4f}) | Saved best.pth and best_model.ema.pth")
+                else:
+                    print(f"[INFO] New best mIoU: {self.best_miou:.4f} | Saved best.pth and best_model.ema.pth")
                 # 4) Restore original weights
                 self.ema.restore(self.model)  
 
@@ -1070,9 +1147,10 @@ class FusionTrainer:
         if self.ema and checkpoint.get("ema_state_dict"):
             self.ema.load_state_dict(checkpoint["ema_state_dict"], self.device)
 
-        self.start_epoch = 1 #checkpoint["epoch"] + 1
-        self.best_miou = checkpoint["best_miou"]
-        print(f"[INFO] Resuming from best model with best miou: {self.best_miou}")
+        self.start_epoch = 1
+        self.best_miou = float(checkpoint.get("best_miou", 0.0))
+        self.best_landslide_iou = float(checkpoint.get("best_landslide_iou", 0.0))
+        print(f"[INFO] Resuming from best model with best mIoU: {self.best_miou:.4f}, Landslide IoU: {self.best_landslide_iou:.4f}")
         print(f"[INFO] Resume from BEST with optimizer reset @ epoch {self.start_epoch}")
 
     def load_checkpoint(self):
@@ -1135,10 +1213,11 @@ class FusionTrainer:
             except Exception as e:
                 print(f"[WARN] EMA state not loaded: {e}")
         
-        self.start_epoch = 1 #checkpoint["epoch"] + 1
-        self.best_miou = checkpoint['best_miou']
+        self.start_epoch = checkpoint.get("epoch", 0) + 1
+        self.best_miou = float(checkpoint.get('best_miou', 0.0))
+        self.best_landslide_iou = float(checkpoint.get('best_landslide_iou', 0.0))
         
-        print(f"Resumed from epoch {self.start_epoch} with best mIoU: {self.best_miou:.4f}")
+        print(f"Resumed from epoch {self.start_epoch} with best mIoU: {self.best_miou:.4f}, Landslide IoU: {self.best_landslide_iou:.4f}")
     
     def train(self):
         """Main training loop"""
@@ -1161,10 +1240,17 @@ class FusionTrainer:
                 else:
                     self.scheduler.step()
             
-            # Check if best model
-            is_best = miou > self.best_miou
-            if is_best:
-                self.best_miou = miou
+            # Check if best model: Use Landslide class IoU (class 1) for landslide dataset, else mIoU
+            if self.config.dataset == 'landslide' or self.config.num_classes == 2:
+                landslide_iou = float(class_ious[1]) if len(class_ious) > 1 else float(miou)
+                is_best = landslide_iou > self.best_landslide_iou
+                if is_best:
+                    self.best_landslide_iou = landslide_iou
+                    self.best_miou = miou
+            else:
+                is_best = miou > self.best_miou
+                if is_best:
+                    self.best_miou = miou
             
             # Save checkpoint
             self.save_checkpoint(epoch, is_best)
@@ -1173,7 +1259,11 @@ class FusionTrainer:
             print(f"\nEpoch {epoch}/{self.config.epochs}")
             print(f"Train Loss: {train_loss:.4f} (Main: {train_main_loss:.4f}, Aux: {train_aux_loss:.4f})")
             print(f"Val Loss: {val_loss:.4f}")
-            print(f"mIoU: {miou:.4f} (Best: {self.best_miou:.4f})")
+            if self.config.dataset == 'landslide' or self.config.num_classes == 2:
+                cur_ls_iou = class_ious[1] if len(class_ious) > 1 else 0.0
+                print(f"Landslide IoU: {cur_ls_iou:.4f} (Best: {self.best_landslide_iou:.4f}) | mIoU: {miou:.4f}")
+            else:
+                print(f"mIoU: {miou:.4f} (Best: {self.best_miou:.4f})")
             print(f"Pixel Acc: {pixel_acc:.4f}")
             
             # Log class-wise IoU
@@ -1366,6 +1456,10 @@ def main():
                         help='Use multiple GPUs')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--deterministic', action='store_true', default=False,
+                        help='Enable cuDNN deterministic mode for exact reproducibility')
+    parser.add_argument('--benchmark', action='store_true', default=False,
+                        help='Enable cuDNN benchmark mode for faster training throughput')
     parser.add_argument('--use_wandb', action='store_true',
                         help='Use Weights & Biases for logging')
     

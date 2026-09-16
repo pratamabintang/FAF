@@ -23,15 +23,15 @@ parser.add_argument('--dataset_split', '-d', type=str, default='test') # test, v
 parser.add_argument('--have_test_labels', '-htl', type=bool, default=True) 
 parser.add_argument('--gpu', '-g', type=int, default=0)
 #############################################################################################
-parser.add_argument('--img_height', '-ih', type=int, default=480) 
-parser.add_argument('--img_width', '-iw', type=int, default=640)  
+parser.add_argument('--img_height', '-ih', type=int, default=512) 
+parser.add_argument('--img_width', '-iw', type=int, default=512)  
 parser.add_argument('--num_workers', '-j', type=int, default=4)
 parser.add_argument('--n_class', '-nc', type=int, default=2)
 parser.add_argument('--context_dim', type=str, default='[96,192,384,768]')
 parser.add_argument('--dataset', type=str, default='landslide', choices=['landslide', 'mfnet', 'pst900'],
                     help='Dataset to evaluate: landslide (2 classes), mfnet (9 classes) or pst900 (5 classes)')
 parser.add_argument('--data_dir', '-dr', type=str, default='./dataset/dataset_1')
-parser.add_argument('--model_dir', '-wd', type=str, default='Experiments/faf_reproducible_experiment_v1')
+parser.add_argument('--model_dir', '-wd', type=str, default='Experiments/faf_landslide_experiment_v1')
 parser.add_argument('--visualize', action='store_true', default=True, help='Save prediction masks and side-by-side diagnostic panels')
 #############################################################################################
 # ---- TTA argümanları ----
@@ -50,7 +50,7 @@ parser.add_argument('--rgb_arch', type=str, default='convnextv2_tiny.fcmae_ft_in
                     help='timm model name for RGB backbone')
 parser.add_argument('--ir_arch', type=str, default='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
                     help='timm model name for IR backbone')
-parser.add_argument('--decoder_type', type=str, default='fpn', choices=['fpn', 'panet'],
+parser.add_argument('--decoder_type', type=str, default='panet', choices=['fpn', 'panet'],
                     help='Decoder type: fpn or panet')
 parser.add_argument('--deep_supervision', action='store_true', default=False,
                     help='Enable deep supervision for PANet decoder')
@@ -127,78 +127,137 @@ if __name__ == '__main__':
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
-    # prepare save direcotry
-    if os.path.exists("./runs"):
-        print("previous \"./runs\" folder exist, will delete this folder")
-        shutil.rmtree("./runs")
-    os.makedirs("./runs")
+    # Prepare isolated demo output directory (preserve existing runs)
+    save_demo_dir = os.path.join("./runs", "demo_results")
+    os.makedirs(save_demo_dir, exist_ok=True)
     try:
-        os.chmod("./runs", stat.S_IRWXU)  # allow the folder created by docker read, written, and executed by local machine
+        os.chmod(save_demo_dir, stat.S_IRWXU)
     except Exception:
         pass
 
     model_dir = os.path.join(args.model_dir, args.weight_name)
-    if os.path.exists(model_dir) is False:
-        sys.exit("the %s does not exit." %(model_dir))
+    if not os.path.exists(model_dir):
+        sys.exit(f"The model directory {model_dir} does not exist.")
     model_file = os.path.join(model_dir, args.file_name)
-    if os.path.exists(model_file) is True:
-        print('use the final model file.')
+    if not os.path.exists(model_file):
+        sys.exit(f"No checkpoint file found at: {model_file}")
+
+    print(f"Testing {args.model_name}: {args.weight_name} on {device} with PyTorch")
+    print(f"Loading checkpoint file: {model_file} ...")
+    checkpoint = torch.load(model_file, map_location=device, weights_only=False)
+
+    # Recover model configuration from checkpoint
+    ckpt_config = checkpoint.get("config", {})
+    if isinstance(ckpt_config, object) and hasattr(ckpt_config, "__dict__"):
+        ckpt_config = vars(ckpt_config)
+    elif not isinstance(ckpt_config, dict):
+        ckpt_config = {}
+
+    rgb_arch = ckpt_config.get("rgb_arch", args.rgb_arch)
+    ir_arch = ckpt_config.get("ir_arch", args.ir_arch)
+    num_classes = ckpt_config.get("num_classes", args.n_class)
+    decoder_type = ckpt_config.get("decoder_type", args.decoder_type)
+    deep_supervision = ckpt_config.get("deep_supervision", args.deep_supervision)
+    enhanced_fusion = ckpt_config.get("enhanced_fusion", args.enhanced_fusion)
+    use_safd = ckpt_config.get("use_safd", args.use_safd)
+    use_cafg = ckpt_config.get("use_cafg", args.use_cafg)
+    use_tpsw = ckpt_config.get("use_tpsw", args.use_tpsw)
+    include_derivatives = ckpt_config.get("include_derivatives", getattr(args, "include_derivatives", False))
+    ir_in_chans = 4 if include_derivatives else ckpt_config.get("ir_in_chans", getattr(args, "ir_in_chans", 1))
+
+    if "context_dim" in ckpt_config:
+        raw_cd = ckpt_config["context_dim"]
+        if isinstance(raw_cd, str):
+            ctx_dim = [int(x.strip()) for x in raw_cd.strip('[]').split(',')]
+        else:
+            ctx_dim = list(raw_cd)
     else:
-        sys.exit('no model file found.') 
-    print('testing %s: %s on %s with pytorch' % (args.model_name, args.weight_name, str(device)))
-    
-    conf_total = np.zeros((args.n_class, args.n_class))
-    ctx_dim = [int(x.strip()) for x in args.context_dim.strip('[]').split(',')]
-    resolution = (args.img_height, args.img_width)
+        ctx_dim = [int(x.strip()) for x in args.context_dim.strip('[]').split(',')]
+
+    img_h = ckpt_config.get("img_height", args.img_height)
+    img_w = ckpt_config.get("img_width", args.img_width)
+    resolution = (img_h, img_w)
+    dataset_type = ckpt_config.get("dataset", args.dataset)
+
+    # Synchronize args with checkpoint configuration
+    args.n_class = num_classes
+    args.dataset = dataset_type
+    args.img_height = img_h
+    args.img_width = img_w
+
+    print(f"[CONFIG] Instantiating {args.model_name} from checkpoint configuration:")
+    print(f"  rgb_arch: {rgb_arch} | ir_arch: {ir_arch} | ir_in_chans: {ir_in_chans}")
+    print(f"  decoder_type: {decoder_type} | deep_supervision: {deep_supervision}")
+    print(f"  novel_fusion: SAFD={use_safd}, CAFG={use_cafg}, TPSW={use_tpsw}")
+    print(f"  resolution: {resolution} | num_classes: {num_classes} | dataset: {dataset_type}")
+
     model = eval(args.model_name)(
-        rgb_arch=args.rgb_arch,
-        ir_arch=args.ir_arch,
-        num_classes=args.n_class,
+        rgb_arch=rgb_arch,
+        ir_arch=ir_arch,
+        num_classes=num_classes,
         context_dim=ctx_dim,
         input_resolution=resolution,
         rgb_backbone_resolution=resolution,
         ir_backbone_resolution=resolution,
         output_resolution=resolution,
-        decoder_type=args.decoder_type,
-        deep_supervision=args.deep_supervision,
-        enhanced_fusion=args.enhanced_fusion,
-        use_safd=args.use_safd,
-        use_cafg=args.use_cafg,
-        use_tpsw=args.use_tpsw
+        decoder_type=decoder_type,
+        deep_supervision=deep_supervision,
+        enhanced_fusion=enhanced_fusion,
+        use_safd=use_safd,
+        use_cafg=use_cafg,
+        use_tpsw=use_tpsw,
+        ir_in_chans=ir_in_chans
     ).to(device)
-    print('loading model file %s... ' % model_file)
-    checkpoint  = torch.load(model_file, map_location=device, weights_only=False)
 
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"missing: {len(missing)} | unexpected: {len(unexpected)}")
+    # Extract state dict and strip DataParallel 'module.' prefix if present
+    raw_state_dict = checkpoint.get("model_state_dict", checkpoint)
+    state_dict = {
+        (k[7:] if k.startswith("module.") else k): v
+        for k, v in raw_state_dict.items()
+    }
 
-    # if EMA weights exist, load and apply them
+    # Strict weight loading to guarantee architectural congruence
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print("[INFO] Model weights successfully loaded with strict=True.")
+    except Exception as e:
+        print(f"[ERROR] strict=True weight loading failed: {e}")
+        raise
+
+    # If EMA weights exist in checkpoint, apply shadow weights
     if checkpoint.get('ema_state_dict') is not None:
         ema = ModelEMA(model)
         ema.load_state_dict(checkpoint['ema_state_dict'], device)
         ema.apply_shadow(model) 
         print("[INFO] EMA weights loaded and applied.")
     else:
-        print("[INFO] No EMA weights found, using normal weights.")
+        print("[INFO] Using base checkpoint weights.")
 
-            
-    print(f"Loaded model best mIoU: {checkpoint.get('best_miou', 0.0):.4f}")
+    best_miou = checkpoint.get('best_miou', 0.0)
+    best_ls_iou = checkpoint.get('best_landslide_iou', None)
+    if best_ls_iou is not None:
+        print(f"[INFO] Checkpoint records -> Best Landslide IoU: {best_ls_iou:.4f} | Best mIoU: {best_miou:.4f}")
+    else:
+        print(f"[INFO] Checkpoint records -> Best mIoU: {best_miou:.4f}")
 
-    # Load dataset based on --dataset argument
+    # Load dataset based on configuration
     if args.dataset == 'landslide':
         print(f"[INFO] Loading Landslide dataset ({args.n_class} classes)")
         test_dataset = LandslideDataset(
             data_dir=args.data_dir,
             split=args.dataset_split,
             img_size=resolution,
-            is_training=False
+            is_training=False,
+            include_derivatives=include_derivatives,
+            pixel_scale=ckpt_config.get("pixel_scale", 1.0),
+            ignore_nodata=ckpt_config.get("ignore_nodata", True),
+            require_labels=args.have_test_labels
         )
     elif args.dataset == 'pst900':
         print(f"[INFO] Loading PST900 dataset ({args.n_class} classes)")
         test_dataset = PST900Dataset(
             data_dir=args.data_dir,
-            split=args.dataset_split,  # 'test' for PST900
+            split=args.dataset_split,
             rgb_size=resolution,
             thermal_size=resolution,
             have_label=args.have_test_labels,
@@ -215,7 +274,6 @@ if __name__ == '__main__':
         raise ValueError(f"Unknown dataset: {args.dataset}")
         
     batch_size = 1
-    # Create loader
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -230,14 +288,17 @@ if __name__ == '__main__':
         mult = 2 if args.tta_flip else 1
         print(f"[INFO] TTA enabled | scales={args.tta_scales} | flip={args.tta_flip} "
               f"| total-forwards-per-image={len(args.tta_scales)*mult}")    
+
+    conf_total = np.zeros((num_classes, num_classes))
     ave_time_cost = 0.0
+    timed_frames = 0
     use_cuda_events = torch.cuda.is_available()
     if use_cuda_events:
         starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
 
     if args.use_tent:
         model = configure_model(model)
-        tent_params,param_names = collect_params(model)
+        tent_params, param_names = collect_params(model)
         for p, name in zip(tent_params, param_names):
             if not p.requires_grad:
                 print(f"[WARN] Param {name} does not have requires_grad=True")
@@ -248,6 +309,7 @@ if __name__ == '__main__':
 
     if not args.use_tent:
         model.eval()
+
     for it, (rgb, ir, labels, img_name) in enumerate(test_loader):
         rgb = rgb.to(device)
         ir = ir.to(device)
@@ -259,7 +321,7 @@ if __name__ == '__main__':
             
         if args.tta:
             with torch.no_grad():
-                logits = tta_inference(model, rgb, ir, scales=args.tta_scales, do_flip=args.tta_flip, output_size=(args.img_height, args.img_width))
+                logits = tta_inference(model, rgb, ir, scales=args.tta_scales, do_flip=args.tta_flip, output_size=resolution)
                 aux = None
         elif args.use_tent:
             logits = tent(rgb, ir)
@@ -275,16 +337,19 @@ if __name__ == '__main__':
         else:
             curr_time = (time.perf_counter() - t0) * 1000.0
             
-        if it >= 5: # ignore the first 5 frames
+        if len(test_loader) > 5:
+            if it >= 5: # ignore warmup frames
+                ave_time_cost += curr_time
+                timed_frames += 1
+        else:
             ave_time_cost += curr_time
-        # convert tensor to numpy 1d array
+            timed_frames += 1
+
         label = labels.cpu().numpy().squeeze().flatten()
-        prediction = logits.argmax(1).cpu().numpy().squeeze().flatten() # prediction and label are both 1-d array
-        # generate confusion matrix frame-by-frame
-        conf = confusion_matrix(y_true=label, y_pred=prediction, labels=list(range(args.n_class))) # conf is an n_class*n_class matrix
+        prediction = logits.argmax(1).cpu().numpy().squeeze().flatten()
+        conf = confusion_matrix(y_true=label, y_pred=prediction, labels=list(range(num_classes)))
         conf_total += conf
         
-        # save demo images & diagnostic panels
         if args.visualize:
             sample_name = img_name[0] if isinstance(img_name, (list, tuple)) else str(img_name)
             visualize(
@@ -295,36 +360,57 @@ if __name__ == '__main__':
                 ir=ir,
                 labels=labels,
                 dataset=args.dataset,
-                save_dir=os.path.join("./runs", "demo_results"),
+                save_dir=save_demo_dir,
                 save_side_by_side=True
             )
         print("%s, %s, frame %d/%d, %s, time cost: %.2f ms, demo result processed."
-                %(args.model_name, args.weight_name, it+1, len(test_loader), str(it), curr_time))
+              % (args.model_name, args.weight_name, it+1, len(test_loader), str(it), curr_time))
 
     precision_per_class, recall_per_class, iou_per_class, f1score = compute_results(conf_total)
-    conf_total_matfile = os.path.join("./runs", 'conf_'+args.weight_name+'.mat')
-    savemat(conf_total_matfile,  {'conf': conf_total}) # 'conf' is the variable name when loaded in Matlab
- 
+    conf_total_matfile = os.path.join(save_demo_dir, 'conf_' + args.weight_name + '.mat')
+    savemat(conf_total_matfile, {'conf': conf_total})
+
+    if dataset_type == 'landslide' or num_classes == 2:
+        class_names = ["Background", "Landslide"]
+    elif dataset_type == 'pst900' or num_classes == 5:
+        class_names = ["Background", "Fire Extinguisher", "Backpack", "Hand Drill", "Rescue Randy"]
+    elif dataset_type == 'mfnet' or num_classes == 9:
+        class_names = ["Unlabeled", "Car", "Person", "Bike", "Curve", "Car Stop", "Guardrail", "Color Cone", "Bump"]
+    else:
+        class_names = [f"Class_{i}" for i in range(num_classes)]
+
     device_name = torch.cuda.get_device_name(args.gpu) if torch.cuda.is_available() else 'CPU'
     print('\n###########################################################################')
-    print('\n%s: %s test results (with batch size %d) on %s using %s:' %(args.model_name, args.weight_name, batch_size, datetime.date.today(), device_name)) 
-    print('\n* the tested dataset name: %s' % args.dataset_split)
-    print('* the tested image count: %d' % len(test_loader))
-    print('* the tested image size: %d*%d' %(args.img_height, args.img_width)) 
-    print('* the weight name: %s' %args.weight_name) 
-    print('* the file name: %s' %args.file_name)
-    print('\n* the per-class recall:')
-    for i in range(args.n_class):
-        print('    Class %d: %.6f' % (i, recall_per_class[i]))
-    print('\n* the per-class iou:')
-    for i in range(args.n_class):
-        print('    Class %d: %.6f' % (i, iou_per_class[i]))
-    print('\n* the per-class f1score:')
-    for i in range(args.n_class):
-        print('    Class %d: %.6f' % (i, f1score[i]))
-    print("\n* average values (np.mean(x)): \n recall: %.6f, iou: %.6f, precision: %.6f, f1score: %.6f " \
-          %(recall_per_class.mean(), iou_per_class.mean(), precision_per_class.mean(), f1score.mean()))
-    print("* average values (np.mean(np.nan_to_num(x))): \n recall: %.6f, iou: %.6f, precision: %.6f, f1score: %.6f " \
-          %(np.mean(np.nan_to_num(recall_per_class)), np.mean(np.nan_to_num(iou_per_class)),precision_per_class.mean(), f1score.mean()))
-    print('\n* the average time cost per frame (with batch size %d): %.2f ms, namely, the inference speed is %.2f fps' %(batch_size, ave_time_cost/(len(test_loader)-5), 1000/(ave_time_cost/(len(test_loader)-5)))) # ignore the first 10 frames
-    print('\n###########################################################################')
+    print('\n%s: %s test results (with batch size %d) on %s using %s:' % (args.model_name, args.weight_name, batch_size, datetime.date.today(), device_name)) 
+    print('\n* Tested dataset: %s (split: %s)' % (dataset_type, args.dataset_split))
+    print('* Tested image count: %d' % len(test_loader))
+    print('* Tested image size: %d x %d' % (img_h, img_w)) 
+    print('* Weight dir: %s' % args.weight_name) 
+    print('* Checkpoint file: %s' % args.file_name)
+
+    print('\n* Per-class Recall:')
+    for i in range(num_classes):
+        cname = class_names[i] if i < len(class_names) else f"Class_{i}"
+        print(f'    [{i}] {cname:<18}: {recall_per_class[i]:.6f}')
+
+    print('\n* Per-class IoU:')
+    for i in range(num_classes):
+        cname = class_names[i] if i < len(class_names) else f"Class_{i}"
+        print(f'    [{i}] {cname:<18}: {iou_per_class[i]:.6f}')
+
+    print('\n* Per-class F1-score:')
+    for i in range(num_classes):
+        cname = class_names[i] if i < len(class_names) else f"Class_{i}"
+        print(f'    [{i}] {cname:<18}: {f1score[i]:.6f}')
+
+    print("\n* Mean metrics across all classes:")
+    print("  Recall: %.6f | IoU (mIoU): %.6f | Precision: %.6f | F1-score: %.6f"
+          % (recall_per_class.mean(), iou_per_class.mean(), precision_per_class.mean(), f1score.mean()))
+
+    if dataset_type == 'landslide' or num_classes == 2:
+        print(f"\n* [PRIMARY METRIC] Landslide (Class 1) IoU: {iou_per_class[1]:.4f} | F1-Score: {f1score[1]:.4f}")
+
+    mean_time_ms = ave_time_cost / max(timed_frames, 1)
+    fps = (1000.0 / mean_time_ms) if mean_time_ms > 0 else 0.0
+    print(f'\n* Average time cost per frame: {mean_time_ms:.2f} ms (over {timed_frames} timed frames) -> {fps:.2f} FPS')
+    print('###########################################################################')

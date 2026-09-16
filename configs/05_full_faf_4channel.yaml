@@ -1,10 +1,10 @@
 # ==============================================================================
-# Frequency-Aware Fusion (FAF) - Reproducible Experiment Configuration
-# Tailored for Landslide RGB + DTM Multimodal Semantic Segmentation
+# FAF Experiment Configuration - Stage 5: Full FAF + 4-Channel Topographic Derivatives (Slope + Sin/Cos Aspect)
 # ==============================================================================
 
+
 # --- 1. Experiment & Logging Metadata ---
-exp_name: "faf_landslide_experiment_v1"
+exp_name: "05_full_faf_4channel"
 exp_dir: "Experiments"
 log_interval: 10
 verbose: true
@@ -36,7 +36,7 @@ dtm_mean: 72.82                         # Empirical mean elevation (meters)
 dtm_std: 58.01                          # Empirical std elevation (meters)
 
 # Topographic Derivatives & Sampling Configuration
-include_derivatives: false              # If true, computes [DTM, Slope, Sin(Aspect), Cos(Aspect)] (4 channels)
+include_derivatives: true              # If true, computes [DTM, Slope, Sin(Aspect), Cos(Aspect)] (4 channels)
 pixel_scale: 1.0                        # Physical spatial resolution (meters/pixel)
 ignore_nodata: true                     # Labels invalid DTM NoData regions with ignore_index (-100)
 positive_aware_sampling: true           # Enables balanced crop centering on positive landslide areas
@@ -59,11 +59,11 @@ distill_layers_enabled: false
 
 # Decoder & Novel Attention Modules
 decoder_type: "panet"                  # Options: "fpn" | "panet"
-deep_supervision: false
+deep_supervision: true
 enhanced_fusion: false
-use_safd: false                        # Scene-Adaptive Frequency Decomposition (Novel)
-use_cafg: false                        # Complementarity-Aware Fusion Gate (Novel)
-use_tpsw: false                        # Thermal/Terrain Prior-Guided Spatial Weighting (Novel)
+use_safd: true                        # Scene-Adaptive Frequency Decomposition (Novel)
+use_cafg: true                        # Complementarity-Aware Fusion Gate (Novel)
+use_tpsw: true                        # Thermal/Terrain Prior-Guided Spatial Weighting (Novel)
 
 # Pretrained weights / Checkpoint Resume
 rgb_model_path: ""
@@ -90,7 +90,7 @@ t0: 50
 step_size: 45
 
 # --- 7. Loss Functions & Extreme Class Imbalance Mitigation ---
-loss_type: "combo_ohem"                # Options: "combo3" | "combo_ohem" (CE + Dice + Lovasz + OHEM + Boundary)
+loss_type: "combo3"                # Options: "combo3" | "combo_ohem" (CE + Dice + Lovasz + OHEM + Boundary)
 ce_weight: 0.35
 dice_weight: 0.35
 lovasz_weight: 0.30

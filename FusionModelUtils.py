@@ -145,13 +145,17 @@ def visualize(
             cur_rgb = rgb_np[idx]
             if cur_rgb.ndim == 3 and cur_rgb.shape[0] == 3:
                 cur_rgb = np.transpose(cur_rgb, (1, 2, 0))
-            # Denormalize roughly if normalized
-            if cur_rgb.max() <= 1.0 and cur_rgb.min() < 0:
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
-                cur_rgb = np.clip((cur_rgb * std + mean) * 255.0, 0, 255).astype(np.uint8)
-            elif cur_rgb.max() <= 1.0:
-                cur_rgb = np.clip(cur_rgb * 255.0, 0, 255).astype(np.uint8)
+            # Denormalize standard ImageNet normalized RGB
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            if cur_rgb.dtype != np.uint8:
+                if cur_rgb.min() < 0.0 or cur_rgb.max() <= 5.0:
+                    # Standardized with (x - mean) / std
+                    cur_rgb = np.clip((cur_rgb * std + mean) * 255.0, 0, 255).astype(np.uint8)
+                elif cur_rgb.max() <= 1.0:
+                    cur_rgb = np.clip(cur_rgb * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    cur_rgb = np.clip(cur_rgb, 0, 255).astype(np.uint8)
             else:
                 cur_rgb = np.clip(cur_rgb, 0, 255).astype(np.uint8)
 

@@ -38,7 +38,9 @@ def get_backbone_context_dim(arch_name: str) -> List[int]:
 class FusionModel(nn.Module):    
     def __init__(
         self,
-        rgb_arch='convnextv2_tiny.fcmae_ft_in22k_in1k_384', ir_arch='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+        rgb_arch='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+        ir_arch='convnextv2_tiny.fcmae_ft_in22k_in1k_384',
+        terrain_arch: Optional[str] = None,
         pretrained = True,
         num_classes: int = 9,
         fusion_strategy: str = "middle_attention",
@@ -49,26 +51,34 @@ class FusionModel(nn.Module):
         context_dim: Optional[List[int]] = None,
         input_resolution: Tuple[int, int] = (480, 640),
         rgb_backbone_resolution: Tuple[int, int] = (480, 640),  # For RGB backbone
-        ir_backbone_resolution: Tuple[int, int] = (480, 640),   # For IR backbone
+        ir_backbone_resolution: Tuple[int, int] = (480, 640),   # For IR/Terrain backbone
+        terrain_backbone_resolution: Optional[Tuple[int, int]] = None,
         output_resolution: Tuple[int, int] = (480, 640),  # Final output resolution
         decoder_type: str = "fpn",  # "fpn" (original) or "panet" (new bidirectional)
         deep_supervision: bool = False,  # Enable deep supervision for PANet decoder
         enhanced_fusion: bool = False,  # Use EnhancedSemanticFusion for stages 3-4
         use_safd: bool = False,       # Novel: Scene-Adaptive Frequency Decomposition
         use_cafg: bool = False,       # Novel: Complementarity-Aware Fusion Gate
-        use_tpsw: bool = False,       # Novel: Thermal Prior-Guided Spatial Weighting
+        use_tpsw: bool = False,       # Novel: Terrain/Thermal Prior-Guided Spatial Weighting
+        ir_in_chans: int = 1,         # Input channels for IR/Terrain (1 for DTM, 4 with derivatives)
+        terrain_in_chans: Optional[int] = None,
     ):
         super().__init__()
+
+        effective_terrain_arch = terrain_arch if terrain_arch is not None else ir_arch
+        effective_terrain_in_chans = terrain_in_chans if terrain_in_chans is not None else ir_in_chans
+        effective_terrain_resolution = terrain_backbone_resolution or ir_backbone_resolution
 
         self.decoder_type = decoder_type
         self.enhanced_fusion = enhanced_fusion
         self.use_safd = use_safd
         self.use_cafg = use_cafg
         self.use_tpsw = use_tpsw
+        self.ir_in_chans = self.terrain_in_chans = effective_terrain_in_chans
 
         self.input_resolution = input_resolution
         self.rgb_backbone_resolution = rgb_backbone_resolution
-        self.ir_backbone_resolution = ir_backbone_resolution
+        self.ir_backbone_resolution = self.terrain_backbone_resolution = effective_terrain_resolution
         self.output_resolution = output_resolution
         self.num_classes = num_classes
         self.distill_layers_enabled = distill_layers_enabled
@@ -82,12 +92,12 @@ class FusionModel(nn.Module):
             features_only=True,
         )
         
-        # --- 2. IR Backbone (ConvNeXt V2 / MobileNet) ---
+        # --- 2. Terrain Backbone (ConvNeXt V2) ---
         self.ir_encoder = timm.create_model(
-            ir_arch,
+            effective_terrain_arch,
             pretrained=pretrained,
             features_only=True,
-            in_chans=1, 
+            in_chans=effective_terrain_in_chans, 
         )
 
         # Learn channel configuration directly from encoders
@@ -147,10 +157,10 @@ class FusionModel(nn.Module):
         ) / 1e6
         print(f"Number of parameters for ir encoder {ir_arch}: {num_of_params:.2f} M")
 
-        # --- Thermal Prior Module (raw IR -> spatial prior) ---
+        # --- Terrain Prior Module (raw DTM/Terrain -> spatial prior) ---
         if use_tpsw:
-            print(f"[FusionModel] [3] Thermal Prior-Guided Spatial Weighting ENABLED")
-            self.thermal_prior = ThermalPriorModule()
+            print(f"[FusionModel] [3] Topographic Prior-Guided Spatial Weighting (TPSW) ENABLED")
+            self.terrain_prior = self.thermal_prior = TerrainPriorModule(in_channels=effective_terrain_in_chans)
 
         # --- Fusion Stages ---
         # Stage 1-2: Frequency-aware fusion (low-level details)
@@ -199,38 +209,44 @@ class FusionModel(nn.Module):
         return features
 
         
-    def forward(self, rgb, ir):
-        # Extract features (with gradients now)
-        rgb_features = self.extract_features(rgb, self.rgb_encoder)
-        ir_features = self.extract_features(ir, self.ir_encoder)
+    def forward(self, rgb, ir=None, terrain=None):
+        if terrain is None:
+            terrain = ir
+        if terrain is None:
+            raise ValueError("FusionModel requires either 'terrain' or 'ir' modality tensor.")
 
-        # Thermal Prior Maps (from raw IR, before any backbone processing)
+        # Extract multi-scale features from optical and terrain encoders
+        rgb_features = self.extract_features(rgb, self.rgb_encoder)
+        terrain_features = self.extract_features(terrain, self.ir_encoder)
+
+        # Topographic Prior Maps (from raw DTM/terrain, before backbone processing)
         if self.use_tpsw:
             target_sizes = [f.shape[2:] for f in rgb_features]
-            thermal_priors = self.thermal_prior(ir, target_sizes)
+            terrain_priors = self.thermal_prior(terrain, target_sizes)
 
-        # Stage-wise fusion
-        fused = self.fusion_stage1(rgb_features[0], ir_features[0])  # Stage 1 Fusion
+        # Stage-wise multimodal fusion
+        fused = self.fusion_stage1(rgb_features[0], terrain_features[0])  # Stage 1 Fusion
         fused = [fused]
-        fused.append(self.fusion_stage2(rgb_features[1], ir_features[1]))  # Stage 2 Fusion
-        fused.append(self.fusion_stage3(rgb_features[2], ir_features[2]))  # Stage 3 Fusion
-        fused.append(self.fusion_stage4(rgb_features[3], ir_features[3]))  # Stage 4 Fusion 
+        fused.append(self.fusion_stage2(rgb_features[1], terrain_features[1]))  # Stage 2 Fusion
+        fused.append(self.fusion_stage3(rgb_features[2], terrain_features[2]))  # Stage 3 Fusion
+        fused.append(self.fusion_stage4(rgb_features[3], terrain_features[3]))  # Stage 4 Fusion 
 
-        # Apply Thermal Prior-Guided Spatial Weighting
+        # Apply Topographic Prior-Guided Spatial Weighting
         if self.use_tpsw:
-            fused = [f * (1 + tp) for f, tp in zip(fused, thermal_priors)]
+            fused = [f * (1 + tp) for f, tp in zip(fused, terrain_priors)]
 
         main_logits, aux_logits = self.decoder(fused)
         return main_logits, aux_logits
 
 # ==========================================
-# 1. SCALAR CONFIDENCE GATE (Gece/Gündüz Bekçisi)
+# 1. SCALAR CONFIDENCE GATE (Optical Quality & Reliability Gate)
 # ==========================================
 class ScalarConfidenceGate(nn.Module):
     """
-    RGB görüntüsünün genel güvenilirliğini ölçer.
-    Çıktı: [B, 1, 1, 1] boyutunda 0-1 arası bir skaler.
-    Kanal bazlı değil, global karar verir (Modelin bir kısmını öldürmemek için).
+    Measures global optical reliability of the RGB aerial/satellite input 
+    (assessing shadow occlusion, cloud cover, vegetation density, or haze).
+    Output: [B, 1, 1, 1] scalar confidence weight in [0, 1].
+    Provides global optical quality context to balance optical vs terrain features.
     """
     def __init__(self, channels):
         super().__init__()
@@ -239,25 +255,30 @@ class ScalarConfidenceGate(nn.Module):
             nn.Conv2d(channels, channels // 2, 1, bias=False),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels // 2, 1, 1, bias=False),
-            nn.Sigmoid()                      # 0 (Güvenilmez) - 1 (Güvenilir)
+            nn.Sigmoid()                      # 0 (Low optical reliability) - 1 (High optical reliability)
         )
 
     def forward(self, x):
         return self.gate(x)
 
 # ==========================================
-# 2. SAFE RESIDUAL FUSION (Güvenli Birleştirici)
+# 2. SAFE RESIDUAL FUSION (Optical-Terrain Residual Combiner)
 # ==========================================
 class SafeResidualFusion(nn.Module):
+    """
+    Fuses optical features with frequency-refined terrain features via residual delta modulation.
+    Uses optical confidence to dynamically determine whether terrain morphology should correct
+    optical artifacts (shadows, dense canopy) while preserving gradient highways.
+    """
     def __init__(self, channels):
         super().__init__()
         
-        # A. Güven Kapısı
+        # A. Optical Confidence Gate
         self.rgb_gate = ScalarConfidenceGate(channels)
         
-        # B. Delta (Düzeltme) Üretici
-        # RGB ve IR'ı alıp, RGB'yi düzeltecek "farkı" hesaplar.
-        # SONUNDA RELU YOKTUR! (Negatif değerlere izin verilmeli ki gürültüyü silebilsin)
+        # B. Residual Delta Generator
+        # Computes residual correction from concatenated optical and terrain features.
+        # No final ReLU to allow bidirectional correction (positive elevation cues or shadow subtraction).
         self.refine = nn.Sequential(
             nn.Conv2d(channels*2, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -267,21 +288,16 @@ class SafeResidualFusion(nn.Module):
         )
 
     def forward(self, rgb_feat, ir_final):
-        # 1. RGB'nin durumuna bak (Karanlık mı? Gürültülü mü?)
+        # 1. Assess global optical quality
         score = self.rgb_gate(rgb_feat)
         
-        # 2. Refine Bloğuna İpucu Ver
-        # RGB'yi score ile çarparak birleştiriyoruz.
-        # Eğer score düşükse, refine bloğu "RGB bozuk, IR'a güvenip negatif delta üretmeliyim" der.
+        # 2. Gate optical features and concatenate with terrain features
         fused_input = torch.cat([rgb_feat * score, ir_final], dim=1)
         
-        # 3. Delta (Düzeltme) Hesapla
+        # 3. Calculate residual topographic delta
         delta = self.refine(fused_input)
         
-        # 4. GÜVENLİ ÇIKIŞ (Residual Connection)
-        # RGB ana hattını ASLA score ile çarpmıyoruz.
-        # Bu sayede gradyan akışı asla kesilmez (Backbone ölmez).
-        # Gürültü varsa, 'delta' onu matematiksel olarak siler (Noise Cancellation).
+        # 4. Safe Residual Connection preserving primary optical representations
         return rgb_feat + delta
 
 # ==========================================
@@ -650,14 +666,16 @@ class AdaptiveGaussianLowPass(nn.Module):
 # ==========================================
 class ComplementarityAwareFusionGate(nn.Module):
     """
-    Measures inter-modal complementarity via feature-space cosine distance,
+    Measures optical-terrain complementarity via feature-space cosine distance,
     then routes fusion through simple (for redundant regions) or deep
     (for complementary regions) pathways.
     
-    Novelty: Explicitly quantifies WHERE two modalities provide different 
-    vs similar information, and allocates fusion complexity accordingly.
-    This is fundamentally different from attention-based methods that learn 
-    "where to look" without explicitly modeling inter-modal agreement.
+    Landslide Domain Formulation:
+    Optical imagery provides spectral texture and vegetation context, while DTM provides 
+    morphological surface elevation and slope structure.
+    Where optical and terrain cues are complementary (e.g. vegetated landslide scarps where
+    canopy obscures optical texture but terrain reveals the slope rupture), CAFG dynamically
+    activates deep non-linear multimodal reasoning.
     """
     def __init__(self, channels, proj_dim=None):
         super().__init__()
@@ -682,67 +700,71 @@ class ComplementarityAwareFusionGate(nn.Module):
     def forward(self, rgb_feat, ir_feat):
         """
         Args:
-            rgb_feat: [B, C, H, W]
-            ir_feat:  [B, C, H, W] (must be same channel count)
+            rgb_feat: [B, C, H, W] Optical features
+            ir_feat:  [B, C, H, W] Terrain features (must match channel count)
         Returns:
             fused: [B, C, H, W]
         """
-        # Complementarity map via cosine distance
+        # Complementarity map via cosine distance in projected subspace
         rgb_proj = F.normalize(self.comp_proj(rgb_feat), dim=1)
         ir_proj = F.normalize(self.comp_proj(ir_feat), dim=1)
 
-        # High = complementary (modalities disagree), Low = redundant (agree)
+        # High = complementary (distinct modality signals), Low = redundant (aligned signals)
         comp_map = (1.0 - (rgb_proj * ir_proj).sum(dim=1, keepdim=True)).clamp(0, 1)
 
-        # Redundant regions → simple addition is sufficient
+        # Redundant regions → efficient residual summation
         simple_out = rgb_feat + ir_feat
-        # Complementary regions → need deeper cross-modal reasoning
+        # Complementary regions → deep cross-modal convolution
         deep_out = self.deep_fuse(torch.cat([rgb_feat, ir_feat], dim=1))
 
         return (1 - comp_map) * simple_out + comp_map * deep_out
 
 
 # ==========================================
-# Experiment: Thermal Prior-Guided Spatial Weighting (TPSW)
+# Experiment: Topographic Prior-Guided Spatial Weighting (TPSW)
 # ==========================================
-class ThermalPriorModule(nn.Module):
+class TerrainPriorModule(nn.Module):
     """
-    Extracts physics-informed spatial prior from raw thermal input (pre-backbone).
+    Extracts physics-informed topographic prior features directly from raw DTM/terrain input (pre-backbone).
     
-    Novelty: All existing RGB-T methods process IR through a backbone first, 
-    losing absolute temperature information. This module uses raw thermal values 
-    as a spatial prior — high thermal contrast = likely object boundary.
-    Physics motivation: Thermal cameras measure surface temperature (Planck's law),
-    and temperature discontinuities strongly correlate with object boundaries.
+    Landslide Domain Formulation:
+    Topographic discontinuities, sudden slope breaks, scarp edges, and curvature anomalies 
+    strongly correlate with landslide initiation zones and slip surfaces.
+    This module uses the input elevation/terrain raster to generate multi-scale spatial priors
+    to modulate fused cross-modal features across the network pyramid.
     """
-    def __init__(self):
+    def __init__(self, in_channels: int = 1):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1, bias=False),
+            nn.Conv2d(in_channels, 16, 3, padding=1, bias=False),
             nn.GroupNorm(num_groups=4, num_channels=16),
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, 1, bias=False),
             nn.Sigmoid()
         )
 
-    def forward(self, raw_ir, target_sizes=None):
+    def forward(self, raw_terrain, target_sizes=None):
         """
         Args:
-            raw_ir: [B, 1, H, W] raw thermal input image
+            raw_terrain: [B, C, H, W] raw DTM / terrain input raster
             target_sizes: optional list of (H, W) for each feature scale.
                           If None, defaults to 4 downscaled pyramid stages [H/4, H/8, H/16, H/32].
         Returns:
-            priors: list of [B, 1, Hi, Wi] thermal prior maps
+            priors: list of [B, 1, Hi, Wi] topographic prior maps
         """
-        prior = self.encoder(raw_ir)  # [B, 1, H, W] full-res prior
+        prior = self.encoder(raw_terrain)  # [B, 1, H, W] full-res prior
         if target_sizes is None:
-            H, W = raw_ir.shape[2], raw_ir.shape[3]
+            H, W = raw_terrain.shape[2], raw_terrain.shape[3]
             target_sizes = [(H // 4, W // 4), (H // 8, W // 8), (H // 16, W // 16), (H // 32, W // 32)]
         priors = []
         for size in target_sizes:
             p = F.interpolate(prior, size=size, mode='bilinear', align_corners=False)
             priors.append(p)
         return priors
+
+
+# Backwards-compatibility alias
+ThermalPriorModule = TerrainPriorModule
 
 
 # ==========================================

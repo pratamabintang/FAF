@@ -122,7 +122,8 @@ class TestLandslideDataset(unittest.TestCase):
                 data_dir=tmp_dir,
                 split="train",
                 img_size=(64, 64),
-                is_training=False
+                is_training=False,
+                ignore_nodata=False
             )
 
             rgb, terrain, mask, _ = dataset[0]
@@ -190,6 +191,135 @@ class TestLandslideDataset(unittest.TestCase):
                 self.assertFalse(torch.isnan(terrain).any())
                 print(f"\n[PASS] Real dataset test loaded {len(dataset)} samples successfully from {real_path}")
 
+    def test_missing_label_raises_error(self):
+        """Verify that missing label file raises FileNotFoundError when require_labels=True."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=3)
+            # Delete one label file
+            lbl_dir = os.path.join(tmp_dir, "train", "LABEL")
+            first_label = os.listdir(lbl_dir)[0]
+            os.remove(os.path.join(lbl_dir, first_label))
+
+            with self.assertRaises(FileNotFoundError):
+                _ = LandslideDataset(
+                    data_dir=tmp_dir,
+                    split="train",
+                    require_labels=True
+                )
+
+    def test_unlabeled_inference_allowed_when_require_labels_false(self):
+        """Verify that require_labels=False allows missing labels and returns zeros."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=2)
+            # Remove all labels
+            lbl_dir = os.path.join(tmp_dir, "train", "LABEL")
+            for f in os.listdir(lbl_dir):
+                os.remove(os.path.join(lbl_dir, f))
+
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train",
+                require_labels=False
+            )
+            self.assertEqual(len(dataset), 2)
+            _, _, mask, _ = dataset[0]
+            self.assertEqual(mask.sum().item(), 0)
+
+    def test_spatial_mismatch_raises_error(self):
+        """Verify that spatial dimensions mismatch (RGB != DTM) raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=1)
+            # Overwrite RGB with mismatched size (64x64 instead of 128x128)
+            img_dir = os.path.join(tmp_dir, "train", "IMAGE")
+            img_file = os.path.join(img_dir, os.listdir(img_dir)[0])
+            mismatched_rgb = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+            Image.fromarray(mismatched_rgb).save(img_file)
+
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train"
+            )
+            with self.assertRaises(ValueError):
+                _ = dataset[0]
+
+    def test_unexpected_mask_values_raises_error(self):
+        """Verify that unexpected mask values (e.g. 2, 255) raise ValueError."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=1)
+            lbl_dir = os.path.join(tmp_dir, "train", "LABEL")
+            lbl_file = os.path.join(lbl_dir, os.listdir(lbl_dir)[0])
+            corrupted_mask = np.full((128, 128), 255, dtype=np.uint16)
+            cv2.imwrite(lbl_file, corrupted_mask)
+
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train"
+            )
+            with self.assertRaises(ValueError):
+                _ = dataset[0]
+
+    def test_dtm_nodata_ignore_index_labeling(self):
+        """Verify that when ignore_nodata=True, NoData regions are labeled with ignore_index in mask."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=1)
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train",
+                img_size=(128, 128),
+                is_training=False,
+                ignore_nodata=True,
+                ignore_index=-100
+            )
+            _, _, mask, _ = dataset[0]
+            # Synthetic dataset has NaNs at [0:5, 0:5] and -9999 at [10, 10]
+            self.assertEqual(mask[0, 0].item(), -100)
+            self.assertEqual(mask[10, 10].item(), -100)
+
+    def test_terrain_derivatives_physical_scale_and_aspect_sincos(self):
+        """Verify 4-channel terrain output [DTM, Slope, Sin(Aspect), Cos(Aspect)] with physical pixel scale."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=1)
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train",
+                img_size=(128, 128),
+                is_training=False,
+                include_derivatives=True,
+                pixel_scale=5.0  # 5-meter resolution
+            )
+            _, terrain, _, _ = dataset[0]
+            # Must have 4 channels: [DTM, Slope, Sin_Aspect, Cos_Aspect]
+            self.assertEqual(terrain.shape, torch.Size([4, 128, 128]))
+
+            slope = terrain[1].numpy()
+            sin_aspect = terrain[2].numpy()
+            cos_aspect = terrain[3].numpy()
+
+            # Slope is normalized by pi/2 -> [0, 1]
+            self.assertTrue(np.all(slope >= 0.0) and np.all(slope <= 1.0))
+            # Sin and Cos aspect bounded in [-1.0, 1.0]
+            self.assertTrue(np.all(sin_aspect >= -1.0) and np.all(sin_aspect <= 1.0))
+            self.assertTrue(np.all(cos_aspect >= -1.0) and np.all(cos_aspect <= 1.0))
+
+    def test_positive_aware_sampling(self):
+        """Verify that positive-aware sampling guarantees positive landslide representation in cropped patches."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.create_synthetic_landslide_dataset(tmp_dir, num_samples=1)
+            dataset = LandslideDataset(
+                data_dir=tmp_dir,
+                split="train",
+                img_size=(64, 64),
+                is_training=True,
+                positive_aware_sampling=True,
+                positive_sample_prob=1.0  # Force positive crop
+            )
+            # Run multiple samples to test stability
+            for _ in range(5):
+                _, _, mask, _ = dataset[0]
+                # Check that mask contains at least one landslide pixel (value 1)
+                self.assertTrue((mask == 1).any().item())
+
 
 if __name__ == '__main__':
     unittest.main()
+

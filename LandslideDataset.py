@@ -78,7 +78,13 @@ class LandslideDataset(Dataset):
         rgb_mean: np.ndarray = DEFAULT_RGB_MEAN,
         rgb_std: np.ndarray = DEFAULT_RGB_STD,
         include_derivatives: bool = False,
+        pixel_scale: float = 1.0,
         nodata_value: float = -9999.0,
+        ignore_nodata: bool = True,
+        ignore_index: int = -100,
+        positive_aware_sampling: bool = False,
+        positive_sample_prob: float = 0.5,
+        require_labels: Optional[bool] = None,
     ):
         super().__init__()
         self.data_dir = Path(data_dir).resolve()
@@ -91,7 +97,16 @@ class LandslideDataset(Dataset):
         self.rgb_mean = np.array(rgb_mean, dtype=np.float32)
         self.rgb_std = np.array(rgb_std, dtype=np.float32)
         self.include_derivatives = include_derivatives
+        self.pixel_scale = max(float(pixel_scale), 1e-4)
         self.nodata_value = nodata_value
+        self.ignore_nodata = ignore_nodata
+        self.ignore_index = int(ignore_index)
+        self.positive_aware_sampling = positive_aware_sampling
+        self.positive_sample_prob = float(positive_sample_prob)
+        if require_labels is None:
+            self.require_labels = (self.split in {"train", "val", "test"})
+        else:
+            self.require_labels = bool(require_labels)
 
         # Resolve split directory
         split_candidates = [
@@ -141,6 +156,19 @@ class LandslideDataset(Dataset):
         if not common_stems:
             raise RuntimeError(f"No matching IMAGE and DTM triplets found in {self.split_dir}!")
 
+        if self.require_labels:
+            if not self.lbl_dir.exists():
+                raise FileNotFoundError(
+                    f"Required LABEL directory not found in {self.split_dir} for split '{self.split}'."
+                )
+            missing_labels = [stem for stem in common_stems if stem not in lbl_files]
+            if missing_labels:
+                sample_missing = missing_labels[:5]
+                raise FileNotFoundError(
+                    f"Missing label file(s) for {len(missing_labels)} sample(s) in {self.split_dir} (e.g. {sample_missing}). "
+                    f"Set require_labels=False if running unlabeled inference."
+                )
+
         triplets = []
         for stem in common_stems:
             triplets.append({
@@ -180,6 +208,8 @@ class LandslideDataset(Dataset):
     def _read_mask(self, path: Optional[Path], default_shape: Tuple[int, int]) -> np.ndarray:
         """Reads label mask as integer array: 0=Background, 1=Landslide."""
         if path is None or not path.exists():
+            if self.require_labels:
+                raise FileNotFoundError(f"Label mask not found at {path} while require_labels=True.")
             return np.zeros(default_shape, dtype=np.int64)
 
         mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -189,8 +219,19 @@ class LandslideDataset(Dataset):
         if mask.ndim == 3:
             mask = mask[:, :, 0]
 
-        # Map non-zero values (e.g. 65535, 255, 1) to integer class 1 (Landslide)
-        binary_mask = (mask > 0).astype(np.int64)
+        # Explicit binary mask mapping & strict validation
+        # Allowed values: 0 (Background), 1 or 65535 (Landslide)
+        allowed_values = {0, 1, 65535}
+        unique_vals = np.unique(mask)
+        unexpected = [int(v) for v in unique_vals if v not in allowed_values]
+        if unexpected:
+            raise ValueError(
+                f"Unexpected label values found in mask {path}: {unexpected}. "
+                f"Expected values in {allowed_values} (0=Background, 1 or 65535=Landslide)."
+            )
+
+        binary_mask = np.zeros(mask.shape, dtype=np.int64)
+        binary_mask[(mask == 1) | (mask == 65535)] = 1
         return binary_mask  # Shape: (H, W), int64
 
     def _handle_nodata_and_resize(
@@ -207,6 +248,15 @@ class LandslideDataset(Dataset):
         Handles NaNs and NoData prior to and post-interpolation.
         Fast-path avoids redundant resize and median calculation when data is already clean and correct size.
         """
+        # Validate spatial dimensions consistency across modalities before resizing
+        rgb_hw = rgb.shape[:2]
+        dtm_hw = dtm.shape[:2]
+        mask_hw = mask.shape[:2]
+        if not (rgb_hw == dtm_hw == mask_hw):
+            raise ValueError(
+                f"Spatial dimensions mismatch before resize: RGB={rgb_hw}, DTM={dtm_hw}, Mask={mask_hw}"
+            )
+
         # Fast check: does DTM have invalid / NaN / NoData pixels?
         has_invalid = np.isnan(dtm).any() or np.isinf(dtm).any() or (dtm <= self.nodata_value).any()
 
@@ -242,12 +292,16 @@ class LandslideDataset(Dataset):
                 ).astype(bool)
                 dtm_resized = np.nan_to_num(dtm_resized, nan=fill_val, posinf=fill_val, neginf=fill_val)
                 dtm_resized = np.where(valid_mask_resized, dtm_resized, fill_val)
+                if self.ignore_nodata and self.require_labels:
+                    mask_resized[~valid_mask_resized] = self.ignore_index
             else:
                 dtm_resized = np.nan_to_num(dtm_resized, nan=fill_val, posinf=fill_val, neginf=fill_val)
         else:
             rgb_resized = rgb
             dtm_resized = np.nan_to_num(dtm_clean, nan=fill_val, posinf=fill_val, neginf=fill_val)
             mask_resized = mask.astype(np.int64)
+            if has_invalid and self.ignore_nodata and self.require_labels:
+                mask_resized[~valid_mask] = self.ignore_index
 
         return rgb_resized, dtm_resized, mask_resized
 
@@ -285,8 +339,22 @@ class LandslideDataset(Dataset):
             h, w = dtm.shape
             crop_ratio = random.uniform(0.8, 1.0)
             crop_h, crop_w = int(h * crop_ratio), int(w * crop_ratio)
-            top = random.randint(0, h - crop_h)
-            left = random.randint(0, w - crop_w)
+
+            # Positive-aware crop: center crop around an existing landslide pixel
+            has_pos = (mask == 1).any()
+            if self.positive_aware_sampling and has_pos and random.random() < self.positive_sample_prob:
+                pos_ys, pos_xs = np.where(mask == 1)
+                p_idx = random.randint(0, len(pos_ys) - 1)
+                py, px = pos_ys[p_idx], pos_xs[p_idx]
+                min_top = max(0, py - crop_h + 1)
+                max_top = min(h - crop_h, py)
+                top = random.randint(min_top, max_top) if max_top >= min_top else 0
+                min_left = max(0, px - crop_w + 1)
+                max_left = min(w - crop_w, px)
+                left = random.randint(min_left, max_left) if max_left >= min_left else 0
+            else:
+                top = random.randint(0, h - crop_h) if h > crop_h else 0
+                left = random.randint(0, w - crop_w) if w > crop_w else 0
 
             rgb_cropped = rgb[top:top+crop_h, left:left+crop_w]
             dtm_cropped = dtm[top:top+crop_h, left:left+crop_w]
@@ -295,7 +363,7 @@ class LandslideDataset(Dataset):
             # Bilinear for RGB and DTM, Nearest for Mask
             rgb = cv2.resize(rgb_cropped, (w, h), interpolation=cv2.INTER_LINEAR)
             dtm = cv2.resize(dtm_cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-            mask = cv2.resize(mask_cropped.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.int64)
+            mask = cv2.resize(mask_cropped.astype(np.int64), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.int64)
 
         return rgb, dtm, mask
 
@@ -324,7 +392,7 @@ class LandslideDataset(Dataset):
         return rgb
 
     def _normalize_terrain(self, dtm: np.ndarray) -> np.ndarray:
-        """Normalizes DTM elevation into standardized float32 range."""
+        """Normalizes DTM elevation into standardized float32 range and computes physical derivatives."""
         if self.dtm_norm == "standard":
             dtm_norm = (dtm - self.dtm_mean) / self.dtm_std
         elif self.dtm_norm == "minmax":
@@ -336,12 +404,21 @@ class LandslideDataset(Dataset):
         # Ensure no NaNs or Infs persist in terrain
         dtm_norm = np.nan_to_num(dtm_norm, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
 
-        # Expand channel dimension -> (K, H, W) where K=1 (or K=3 if derivatives enabled)
+        # Expand channel dimension -> (K, H, W) where K=1 (or K=4 if derivatives enabled: [DTM, Slope, Sin_Aspect, Cos_Aspect])
         if self.include_derivatives:
-            gy, gx = np.gradient(dtm)
-            slope = np.arctan(np.sqrt(gx**2 + gy**2)).astype(np.float32)
-            aspect = np.arctan2(-gy, gx).astype(np.float32)
-            terrain = np.stack([dtm_norm, slope, aspect], axis=0)  # [3, H, W]
+            gy, gx = np.gradient(dtm, self.pixel_scale, self.pixel_scale)
+            slope_rad = np.arctan(np.sqrt(gx**2 + gy**2)).astype(np.float32)
+            slope_norm = slope_rad / (np.pi / 2.0)  # Normalized to [0, 1] relative to 90 degrees
+
+            aspect_rad = np.arctan2(-gy, gx).astype(np.float32)
+            sin_aspect = np.sin(aspect_rad).astype(np.float32)
+            cos_aspect = np.cos(aspect_rad).astype(np.float32)
+
+            flat_mask = (slope_rad < 1e-4)
+            sin_aspect[flat_mask] = 0.0
+            cos_aspect[flat_mask] = 0.0
+
+            terrain = np.stack([dtm_norm, slope_norm, sin_aspect, cos_aspect], axis=0)  # [4, H, W]
         else:
             terrain = dtm_norm[np.newaxis, :, :]  # [1, H, W]
 
