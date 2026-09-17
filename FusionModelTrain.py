@@ -697,14 +697,16 @@ class FusionTrainer:
             prefetch_factor=prefetch
         )
         
+        # Validation runs once per epoch: do not keep workers persistent to avoid holding RAM during training
+        val_workers = min(2, self.config.num_workers) if self.config.num_workers > 0 else 0
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
+            num_workers=val_workers,
             pin_memory=torch.cuda.is_available(),
-            persistent_workers=use_persistent,
-            prefetch_factor=prefetch
+            persistent_workers=False,
+            prefetch_factor=prefetch if val_workers > 0 else None
         )
         
         print(f"Train samples: {len(train_dataset)}")
@@ -1115,7 +1117,7 @@ class FusionTrainer:
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
                 # EMA update only when optimizer actually steps
                 if self.ema is not None:
@@ -1194,6 +1196,8 @@ class FusionTrainer:
         pixel_acc = np.trace(conf_total) / np.sum(conf_total)
 
 
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
         return running_loss / len(self.val_loader), miou, pixel_acc, iou_per_class
 
@@ -1358,6 +1362,8 @@ class FusionTrainer:
         print("="*50)
         
         for epoch in range(self.start_epoch, self.config.epochs + 1):
+            import gc
+            gc.collect()
             torch.cuda.empty_cache()
             # Training
             train_loss, train_main_loss, train_aux_loss = self.train_epoch(epoch)
