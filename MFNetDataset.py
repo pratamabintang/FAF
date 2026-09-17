@@ -101,7 +101,7 @@ class MFNetDataset(Dataset):
         ir_size: Tuple[int, int] = (480, 640),
         img_size: Optional[Tuple[int, int]] = None,
         is_training: Optional[bool] = None,
-        ignore_index: int = 255,
+        ignore_index: int = -100,
         use_augmentation: Optional[bool] = None,
     ):
         super().__init__()
@@ -385,6 +385,7 @@ class MFNetDataset(Dataset):
 
         # 6. Return sample
         if mask is not None:
+            mask[mask == 255] = self.ignore_index
             mask_tensor = torch.from_numpy(mask).contiguous().long()
             return rgb_tensor, thermal_tensor, mask_tensor, name
         else:

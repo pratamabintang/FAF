@@ -204,9 +204,11 @@ class ComboLoss3(nn.Module):
             dice = (2.0 * inter + eps) / (union + eps)
             return (1.0 - dice).clamp(min=0.0, max=1.0).mean()
         
-        y1h = F.one_hot(y.clamp(min=0, max=C-1), C).permute(0, 3, 1, 2).float()
-        inter = (probs * y1h).sum(dim=(0, 2, 3))
-        union = probs.sum(dim=(0, 2, 3)) + y1h.sum(dim=(0, 2, 3))
+        valid_mask = (y != self.ignore_index).unsqueeze(1).float()
+        y1h = F.one_hot(y.clamp(min=0, max=C-1), C).permute(0, 3, 1, 2).float() * valid_mask
+        probs_masked = probs * valid_mask
+        inter = (probs_masked * y1h).sum(dim=(0, 2, 3))
+        union = probs_masked.sum(dim=(0, 2, 3)) + y1h.sum(dim=(0, 2, 3))
         dice_per_class = (2.0 * inter + eps) / (union + eps)
         
         weights = getattr(self.ce, 'weight', None)
@@ -830,17 +832,20 @@ class FusionTrainer:
         # Dynamic Inverse Frequency Weighting from computed pixel frequencies
         # w_c = (freq_0 / freq_c), normalized so Background (class 0) = 1.0
         # Uses square-root smoothing (Median Frequency Balancing) to keep training stable
-        inv_freq = 1.0 / (freq + 1e-6)
-        raw_weights = inv_freq / inv_freq[0]  # Base background = 1.0000
-        
-        # Smoothed inverse frequency (square root) scaled by class_weight_multiplier ratio
-        multiplier = getattr(self.config, 'class_weight_multiplier', 10.0)
-        smoothed_ratio = torch.sqrt(raw_weights) * (multiplier / 10.0)
-        weights = torch.tensor([1.0, float(smoothed_ratio[1].clamp(min=2.0, max=50.0))], device=self.device)
+        if self.config.num_classes == 2:
+            inv_freq = 1.0 / (freq + 1e-6)
+            raw_weights = inv_freq / inv_freq[0]  # Base background = 1.0000
+            multiplier = getattr(self.config, 'class_weight_multiplier', 10.0)
+            smoothed_ratio = torch.sqrt(raw_weights) * (multiplier / 10.0)
+            weights = torch.tensor([1.0, float(smoothed_ratio[1].clamp(min=2.0, max=50.0))], device=self.device)
 
-        print("Final Computed Class Weights (from Dataset Frequencies):")
-        print(f"  Class 0 (Background): {weights[0].item():.4f}")
-        print(f"  Class 1 (Landslide) : {weights[1].item():.4f} (Derived from {freq[1].item()*100:.2f}% pixel frequency)")
+            print("Final Computed Class Weights (from Dataset Frequencies):")
+            print(f"  Class 0 (Background): {weights[0].item():.4f}")
+            print(f"  Class 1 (Landslide) : {weights[1].item():.4f} (Derived from {freq[1].item()*100:.2f}% pixel frequency)")
+        else:
+            inv_freq = 1.0 / (freq + 1e-6)
+            weights = (inv_freq / torch.median(inv_freq)).clamp(min=0.2, max=10.0).to(self.device)
+            print(f"Final Computed Multi-Class Weights ({self.config.num_classes} classes): {[round(w.item(), 4) for w in weights]}")
 
         return weights
     
@@ -1044,6 +1049,11 @@ class FusionTrainer:
         ignore_idx = getattr(self.config, 'ignore_index', 0 if getattr(self.config, 'ignore_unlabeled', False) else -100)
 
         for batch_idx, (rgb, ir, masks,_) in enumerate(pbar):
+            # Normalize void / padding sentinel 255 to ignore_idx (-100)
+            if (masks == 255).any():
+                masks = masks.clone()
+                masks[masks == 255] = ignore_idx
+
             # Fail-fast validation on label values: allow valid class IDs or ignore_index (-100)
             valid_mask_values = ((masks >= 0) & (masks < self.config.num_classes)) | (masks == ignore_idx)
             if not valid_mask_values.all():
@@ -1141,6 +1151,9 @@ class FusionTrainer:
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc='Validation')
             for rgb, ir, masks,_ in pbar:
+                if (masks == 255).any():
+                    masks = masks.clone()
+                    masks[masks == 255] = -100
                 rgb = rgb.to(self.device)
                 ir = ir.to(self.device) 
                 masks = masks.to(self.device)
@@ -1382,7 +1395,8 @@ class FusionTrainer:
                 cur_ls_iou = class_ious[1] if len(class_ious) > 1 else 0.0
                 print(f"Landslide IoU: {cur_ls_iou:.4f} (Best: {self.best_landslide_iou:.4f}) | mIoU: {miou:.4f}")
             else:
-                print(f"mIoU: {miou:.4f} (Best: {self.best_miou:.4f})")
+                fg_miou = float(np.mean(class_ious[1:])) if len(class_ious) > 1 else float(miou)
+                print(f"Val mIoU (All {len(class_ious)} classes): {miou:.4f} | Foreground mIoU: {fg_miou:.4f} (Best mIoU: {self.best_miou:.4f})")
             print(f"Pixel Acc: {pixel_acc:.4f}")
             
             # Log class-wise IoU
