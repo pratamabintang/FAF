@@ -150,7 +150,9 @@ class MFNetDataset(Dataset):
         if len(self.names) == 0:
             raise RuntimeError(f"No valid samples found in {split_file} after filtering!")
 
-        print(f"[MFNetDataset] Split: {self.split} | Samples: {len(self.names)} | Resolution: {self.target_h}x{self.target_w} | Augmentations: {self.is_training}")
+        n_filtered = len(raw_lines) - len(self.names)
+        filter_msg = f" (filtered {n_filtered} via blacklist)" if n_filtered > 0 else ""
+        print(f"[MFNetDataset] Split: {self.split} | Samples: {len(self.names)}{filter_msg} | Resolution: {self.target_h}x{self.target_w} | Augmentations: {self.is_training}")
 
     def _resolve_split_file(self, split: str) -> Path:
         """Finds matching split file name."""
@@ -197,29 +199,24 @@ class MFNetDataset(Dataset):
 
         # Read 4-channel image
         img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+        is_bgr = True
         if img is None:
             # Fallback to PIL
             pil_img = Image.open(str(img_path))
             img = np.asarray(pil_img)
-            if img.ndim == 3 and img.shape[2] >= 4:
-                rgb = img[:, :, :3]
-                thermal = img[:, :, 3]
-            elif img.ndim == 3:
-                rgb = img[:, :, :3]
-                thermal = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-            else:
-                rgb = np.stack([img] * 3, axis=-1)
-                thermal = img
+            is_bgr = False
+
+        if img.ndim != 3 or img.shape[2] != 4:
+            raise ValueError(
+                f"{img_path}: expected MFNet image HxWx4, got {img.shape}"
+            )
+
+        if is_bgr:
+            rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+            thermal = img[:, :, 3]
         else:
-            if img.ndim == 3 and img.shape[2] >= 4:
-                rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
-                thermal = img[:, :, 3]
-            elif img.ndim == 3:
-                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                thermal = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else:
-                rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                thermal = img
+            rgb = img[:, :, :3]
+            thermal = img[:, :, 3]
 
         # 2. Resolve label mask path
         mask = None
@@ -234,15 +231,19 @@ class MFNetDataset(Dataset):
                     lbl_path = cand
                     break
 
-            if lbl_path is not None and lbl_path.exists():
-                lbl = cv2.imread(str(lbl_path), cv2.IMREAD_UNCHANGED)
-                if lbl is None:
-                    lbl = np.asarray(Image.open(str(lbl_path)))
-                if lbl.ndim == 3:
-                    lbl = lbl[:, :, 0]
-                mask = lbl.astype(np.int64)
-            else:
-                mask = np.zeros(thermal.shape, dtype=np.int64)
+            if self.have_label and lbl_path is None:
+                raise FileNotFoundError(
+                    f"Missing MFNet label for sample: {name}"
+                )
+
+            lbl = cv2.imread(str(lbl_path), cv2.IMREAD_UNCHANGED)
+            if lbl is None:
+                lbl = np.asarray(Image.open(str(lbl_path)))
+            if lbl is None:
+                raise IOError(f"Could not read label file: {lbl_path}")
+            if lbl.ndim == 3:
+                lbl = lbl[:, :, 0]
+            mask = lbl.astype(np.int64)
 
         # Apply virtual horizontal flip if this is a _flip sample loaded from base
         if needs_flip:

@@ -1474,7 +1474,7 @@ def main():
     
     # Dataset arguments
     parser.add_argument('--dataset', type=str, default='landslide',
-        choices=['landslide'],
+        choices=['landslide', "mfnet"],
         help='Dataset selection: landslide (2 classes)')
     parser.add_argument('--img_height', type=int, default=480,
         help='Input image height (default: 480 for MFNet, 720 for PST900)')

@@ -219,6 +219,43 @@ class TestDatasetLoaders(unittest.TestCase):
         self.assertTrue(((mask_b >= 0) & (mask_b <= 8)).all())
 
 
+    def test_mfnet_fail_fast_incomplete_channels_and_missing_labels(self):
+        """Verify MFNetDataset fail-fast behavior on non-4-channel images and missing labels."""
+        from MFNetDataset import MFNetDataset
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            img_dir = os.path.join(tmp_dir, "images")
+            lbl_dir = os.path.join(tmp_dir, "labels")
+            os.makedirs(img_dir, exist_ok=True)
+            os.makedirs(lbl_dir, exist_ok=True)
+
+            # Split file with 2 samples
+            with open(os.path.join(tmp_dir, "train.txt"), "w") as f:
+                f.write("sample_bad_img\nsample_missing_lbl\n")
+
+            # 1. sample_bad_img: 3-channel image (missing thermal) + valid label
+            img_3ch = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+            Image.fromarray(img_3ch).save(os.path.join(img_dir, "sample_bad_img.png"))
+            lbl_ok = np.zeros((64, 64), dtype=np.uint8)
+            Image.fromarray(lbl_ok).save(os.path.join(lbl_dir, "sample_bad_img.png"))
+
+            # 2. sample_missing_lbl: 4-channel image (RGB+T) but NO label file in labels/
+            img_4ch = np.random.randint(0, 256, (64, 64, 4), dtype=np.uint8)
+            Image.fromarray(img_4ch).save(os.path.join(img_dir, "sample_missing_lbl.png"))
+
+            ds = MFNetDataset(tmp_dir, split="train", have_label=True, is_training=False)
+
+            # Test 1: sample_bad_img MUST raise ValueError (not fallback to grayscale thermal)
+            with self.assertRaises(ValueError) as cm_val:
+                _ = ds[0]
+            self.assertIn("expected MFNet image HxWx4", str(cm_val.exception))
+
+            # Test 2: sample_missing_lbl MUST raise FileNotFoundError (not fallback to zero mask)
+            with self.assertRaises(FileNotFoundError) as cm_fnf:
+                _ = ds[1]
+            self.assertIn("Missing MFNet label for sample: sample_missing_lbl", str(cm_fnf.exception))
+
+
 if __name__ == '__main__':
     unittest.main()
 
