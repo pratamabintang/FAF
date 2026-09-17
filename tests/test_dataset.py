@@ -180,6 +180,45 @@ class TestDatasetLoaders(unittest.TestCase):
 
             self.assertEqual(batch_count, 2)
 
+    def test_real_mfnet_dataset_2_if_exists(self):
+        """Verify real dataset/dataset_2 structure, splits, and virtual flip if present on disk."""
+        data_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dataset", "dataset_2"))
+        if not os.path.exists(data_path):
+            self.skipTest(f"Dataset path {data_path} not found.")
+
+        from MFNetDataset import MFNetDataset, build_mfnet_dataloader, MFNET_CLASSES
+
+        self.assertEqual(len(MFNET_CLASSES), 9)
+
+        # 1. Test train split loading
+        train_ds = MFNetDataset(data_path, split="train", is_training=False)
+        self.assertEqual(len(train_ds), 1568)
+
+        # 2. Test virtual horizontal flip consistency on 00001D and 00001D_flip
+        r0, i0, m0, n0 = train_ds[0]  # 00001D
+        r1, i1, m1, n1 = train_ds[1]  # 00001D_flip
+        self.assertEqual(n0, "00001D")
+        self.assertEqual(n1, "00001D_flip")
+        self.assertTrue(torch.equal(r1, torch.flip(r0, [2])))
+        self.assertTrue(torch.equal(i1, torch.flip(i0, [2])))
+        self.assertTrue(torch.equal(m1, torch.flip(m0, [1])))
+
+        # 3. Test day and night splits
+        test_day_ds = MFNetDataset(data_path, split="test_day", is_training=False)
+        self.assertEqual(len(test_day_ds), 205)
+        test_night_ds = MFNetDataset(data_path, split="test_night", is_training=False)
+        self.assertEqual(len(test_night_ds), 188)
+        self.assertEqual(len(test_day_ds) + len(test_night_ds), 393)
+
+        # 4. Test DataLoader batch collation
+        _, loader = build_mfnet_dataloader(data_path, split="test", batch_size=2, num_workers=0)
+        rgb_b, ir_b, mask_b, names_b = next(iter(loader))
+        self.assertEqual(rgb_b.shape, torch.Size([2, 3, 480, 640]))
+        self.assertEqual(ir_b.shape, torch.Size([2, 1, 480, 640]))
+        self.assertEqual(mask_b.shape, torch.Size([2, 480, 640]))
+        self.assertTrue(((mask_b >= 0) & (mask_b <= 8)).all())
+
 
 if __name__ == '__main__':
     unittest.main()
+

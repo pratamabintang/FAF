@@ -1,11 +1,37 @@
 """
 ================================================================================
-Legacy Dataset Shim: MFNet (RGB-Thermal)
+MFNet Dataset Loader (RGB + Thermal / Infrared)
 ================================================================================
-The MFNet dataset loader has been moved to `legacy/FusionModelDataset.py`.
-This module forwards to the isolated legacy implementation for backwards-compatibility.
-For Landslide RGB-DTM detection, use `LandslideDataset.py`.
+Modernized native PyTorch implementation of the MFNet dataset loader (formerly in legacy/).
+Provides full backwards compatibility as `FusionModelDataset` and `MFNetDataset`.
+Eliminates any external dependency on 'albumentations'.
 ================================================================================
 """
 
-from legacy.FusionModelDataset import *
+from MFNetDataset import (
+    MFNetDataset,
+    MFNET_CLASSES,
+    RGB_MEAN,
+    RGB_STD,
+    IR_MEAN,
+    IR_STD,
+    MFNET_PALETTE,
+    get_mfnet_palette,
+    build_mfnet_dataloader,
+)
+
+# Backwards compatibility alias
+FusionModelDataset = MFNetDataset
+
+__all__ = [
+    "FusionModelDataset",
+    "MFNetDataset",
+    "MFNET_CLASSES",
+    "RGB_MEAN",
+    "RGB_STD",
+    "IR_MEAN",
+    "IR_STD",
+    "MFNET_PALETTE",
+    "get_mfnet_palette",
+    "build_mfnet_dataloader",
+]

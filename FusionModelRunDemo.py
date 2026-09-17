@@ -317,7 +317,7 @@ def main(args=None):
         )
     elif args.dataset == 'mfnet':
         if FusionModelDataset is None:
-            raise ImportError("FusionModelDataset requires 'albumentations' which is not installed.")
+            raise ImportError("Failed to import FusionModelDataset / MFNetDataset.")
         print(f"[INFO] Loading MFNet dataset ({args.n_class} classes)")
         test_dataset = FusionModelDataset(
             data_dir=args.data_dir,

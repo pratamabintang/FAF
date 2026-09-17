@@ -463,10 +463,9 @@ class FusionTrainer:
         self.best_loss = float('inf')
         
         # Load checkpoint if resuming
-        if config.resume == True and config.resume_with_reset == False:
+        if getattr(config, 'resume', False) and not getattr(config, 'resume_with_reset', False):
             self.load_checkpoint()
-
-        elif config.resume == True and config.resume_with_reset == True:
+        elif getattr(config, 'resume', False) and getattr(config, 'resume_with_reset', False):
             self.resume_from_best_with_reset()
     
     def set_seed(self, seed):
@@ -594,9 +593,23 @@ class FusionTrainer:
                 use_augmentation=False
             )
         elif self.config.dataset == 'mfnet':
-            print(f"[INFO] Using MFNet RGB-IR Dataset (9 classes)")
-            train_dataset = FusionModelDataset(self.config.data_root, self.config.train_source, have_label=True)
-            val_dataset  = FusionModelDataset(self.config.data_root, 'test', have_label=True)
+            resolution = (self.config.img_height, self.config.img_width)
+            val_split = getattr(self.config, 'val_source', 'val' if os.path.exists(os.path.join(self.config.data_root, 'val.txt')) else 'test')
+            print(f"[INFO] Using MFNet RGB-IR Dataset ({self.config.num_classes} classes) | Resolution: {resolution[0]}x{resolution[1]} | Val split: {val_split}")
+            train_dataset = FusionModelDataset(
+                data_dir=self.config.data_root,
+                split=self.config.train_source,
+                have_label=True,
+                rgb_size=resolution,
+                ir_size=resolution
+            )
+            val_dataset = FusionModelDataset(
+                data_dir=self.config.data_root,
+                split=val_split,
+                have_label=True,
+                rgb_size=resolution,
+                ir_size=resolution
+            )
         elif self.config.dataset == 'landslide':
             resolution = (self.config.img_height, self.config.img_width)
             print(f"[INFO] Using Landslide RGB-DTM Dataset ({self.config.num_classes} classes)")
@@ -717,7 +730,7 @@ class FusionTrainer:
                 lovasz_w=self.config.lovasz_weight,
                 class_weights=class_weights,
                 ignore_index=ignore_idx,
-                label_smoothing=self.config.label_smoothing
+                label_smoothing=getattr(self.config, 'label_smoothing', 0.0)
             ).to(self.device)
         elif self.config.loss_type == 'combo_ohem':
             # Auto-detect target class for Focal Loss if not specified
@@ -833,7 +846,7 @@ class FusionTrainer:
     
     def setup_optimizer(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        base_lr = self.config.lr_backbone
+        base_lr = getattr(self.config, 'lr_backbone', getattr(self.config, 'learning_rate', 3e-4) * getattr(self.config, 'backbone_lr_ratio', 0.1))
         decay = getattr(self.config, 'layer_decay', 0.90)
         base_wd = getattr(self.config, 'weight_decay', 0.01)
 
@@ -874,17 +887,17 @@ class FusionTrainer:
                 key = f"ir_{layer_id}"
 
             elif "fusion_stage" in name:
-                lr = self.config.lr_fusion
+                lr = getattr(self.config, 'lr_fusion', getattr(self.config, 'learning_rate', 3e-4))
                 wd = base_wd
                 key = "fusion"
 
             elif "terrain_prior" in name or "thermal_prior" in name:
-                lr = self.config.lr_fusion
+                lr = getattr(self.config, 'lr_fusion', getattr(self.config, 'learning_rate', 3e-4))
                 wd = base_wd
                 key = "terrain_prior"
 
             elif "decoder" in name:
-                lr = self.config.lr_decoder
+                lr = getattr(self.config, 'lr_decoder', getattr(self.config, 'learning_rate', 3e-4))
                 wd = base_wd
                 key = "decoder"
 
@@ -904,7 +917,8 @@ class FusionTrainer:
             param_groups[key]["params"].append(param)
 
         # Create optimizer
-        if self.config.optimizer == 'adamw':
+        opt_choice = getattr(self.config, 'optimizer_type', getattr(self.config, 'optimizer', 'adamw')).lower()
+        if opt_choice == 'adamw':
             optimizer = torch.optim.AdamW(
                 list(param_groups.values()),
                 betas=(0.9, 0.999),
@@ -919,8 +933,8 @@ class FusionTrainer:
         return optimizer
     
     def setup_scheduler(self):
-        """Setup learning rate scheduler - MORE STABLE"""
-        if self.config.scheduler == 'cosine':
+        sched_choice = getattr(self.config, 'scheduler_type', getattr(self.config, 'scheduler', 'cosine')).lower()
+        if sched_choice == 'cosine':
             from torch.optim.lr_scheduler import CosineAnnealingLR
             scheduler = CosineAnnealingLR(self.optimizer, T_max=self.config.epochs, eta_min=1e-7)
         elif self.config.scheduler == 'cosine_restart':
@@ -1558,8 +1572,6 @@ def main():
     parser.add_argument('--ema', action='store_true', default=True, help='Track EMA of weights.')
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay.')
     parser.add_argument('--eval_use_ema', action='store_true', default=True, help='Use EMA weights in validation.')
-    parser.add_argument('--eval_tta', action='store_true', default=False, help='Use simple TTA in validation (slow).')
-    parser.add_argument('--tta_scales', type=float, nargs='+', default=[1.0], help='TTA scales, e.g., 0.75 1.0 1.25')
 
     parser.add_argument('--loss_type', type=str, default='combo3', choices=['combo3', 'combo_ohem'],
                     help='combo3: CE+Dice+Lovasz; combo_ohem: CE+Dice+Lovasz+OHEM+Boundary (for rare classes)')

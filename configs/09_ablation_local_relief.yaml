@@ -108,5 +108,3 @@ focal_target_class: 1
 ema: true
 ema_decay: 0.999
 eval_use_ema: true
-eval_tta: false
-tta_scales: [1.0]

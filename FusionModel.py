@@ -130,7 +130,7 @@ class FusionModel(nn.Module):
             print(f"[FusionModel NOTE] Adjusted context_dim {context_dim} -> {active_decoder_channels} to match active backbone {arch_for_context}")
             context_dim = active_decoder_channels
 
-        self.context_dims = self.context_dim = context_dim
+        self.context_dim = context_dim
 
         # ---- Decoder Selection ----
         if decoder_type == "panet":

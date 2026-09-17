@@ -1,0 +1,105 @@
+# ==============================================================================
+# FAF Experiment Configuration - MFNet (RGB + Thermal Benchmark)
+# Baseline Replication & Improvement for Urban Scene Multimodal Segmentation
+# ==============================================================================
+
+# --- 1. Experiment & Logging Metadata ---
+exp_name: "10_baseline_mfnet_rgbt"
+exp_dir: "Experiments"
+log_interval: 10
+verbose: true
+use_wandb: false
+
+# --- 2. Determinism & Reproducibility ---
+seed: 42
+deterministic: false                    # Set true for bit-exact reproducible runs
+benchmark: true                         # Set true for faster training throughput
+
+# --- 3. Hardware & System Configuration ---
+gpu: 0
+multi_gpu: false
+num_workers: 4                          # Parallel CPU workers for DataLoader
+grad_accum_steps: 1                     # Gradient accumulation steps
+
+# --- 4. Dataset Configuration (MFNet RGB-Thermal: dataset/dataset_2) ---
+dataset: "mfnet"                        # Options: "mfnet" (9 classes) | "landslide" (2 classes) | "pst900" (5 classes)
+data_root: "./dataset/dataset_2"
+train_source: "train"                   # Uses train.txt (784 normal + 784 virtual _flip)
+val_source: "test"                      # MFNet evaluation split: "test" (393), "test_day" (205), "test_night" (188), or "val" (392)
+img_height: 480                         # Native MFNet resolution (480x640)
+img_width: 640
+num_classes: 9                          # 9 classes: 0:unlabeled, 1:car, 2:person, 3:bike, 4:curve, 5:car_stop, 6:guardrail, 7:color_cone, 8:bump
+ignore_unlabeled: false                 # Include unlabeled class 0 in loss and mIoU (standard MFNet benchmark)
+ir_in_chans: 1                          # 1 channel Thermal / IR
+
+# --- 5. Model Architecture & Novel Multimodal Modules ---
+# Backbone choices:
+#   - Nano: "convnextv2_nano.fcmae_ft_in22k_in1k_384" -> context_dim: "[80,160,320,640]"
+#   - Tiny: "convnextv2_tiny.fcmae_ft_in22k_in1k_384" -> context_dim: "[96,192,384,768]"
+#   - Base: "convnextv2_base.fcmae_ft_in22k_in1k_384" -> context_dim: "[128,256,512,1024]"
+rgb_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+ir_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+context_dim: "[96,192,384,768]"
+freeze_backbones: false
+
+# Decoder & Novel Attention Modules
+decoder_type: "panet"                   # Options: "panet" | "fpn"
+deep_supervision: false
+enhanced_fusion: false
+use_safd: false                         # Set true to evaluate Scene-Adaptive Frequency Decomposition on RGB-T
+use_cafg: false                         # Set true to evaluate Complementarity-Aware Fusion Gate on RGB-T
+use_tpsw: false                         # Topographic Prior is specifically for DTM terrain (keep false for thermal)
+
+# Pretrained weights / Checkpoint Resume
+rgb_model_path: ""
+ir_model_path: ""
+resume: false
+resume_with_reset: false
+resume_from: ""
+
+# --- 6. Training & Optimization ---
+epochs: 100
+batch_size: 4
+optimizer: "adamw"                     # Options: "adamw" | "sgd"
+learning_rate: 0.0003
+lr_backbone: 0.00003                   # 3e-5 (fine-tuning pretrained backbone)
+lr_fusion: 0.0003                      # 3e-4
+lr_decoder: 0.0003                     # 3e-4
+backbone_lr_ratio: 0.1
+layer_decay: 0.8                       # Layer-wise decay for ConvNeXt backbones
+weight_decay: 0.015
+clip_grad: 5.0
+
+# Learning Rate Scheduler
+scheduler: "cosine_warmup"             # Options: "cosine_warmup" | "cosine" | "poly" | "step" | "plateau" | "none"
+warmup_epochs: 5
+t0: 50
+step_size: 45
+
+# --- 7. Loss Functions ---
+loss_type: "combo3"                    # Options: "combo3" | "combo_ohem"
+ce_weight: 0.5
+dice_weight: 0.3
+lovasz_weight: 0.2
+label_smoothing: 0.0
+class_weights: false                   # Standard MFNet does not require extreme landslide class weighting
+class_weight_multiplier: 1.0
+
+# Auxiliary Loss (active when deep_supervision: true)
+aux_weight_start: 0.3
+aux_weight_end: 0.05
+aux_weight_decay_epoch: 40
+
+# Hard Example Mining & Boundary Loss (active when loss_type: "combo_ohem")
+ohem_weight: 0.1
+boundary_weight: 0.1
+ohem_thresh: 0.7
+ohem_min_kept: 50000
+focal_weight: 0.0
+focal_gamma: 2.0
+focal_target_class: -1                 # -1 = auto-select (Guardrail for MFNet)
+
+# --- 8. Evaluation & EMA (Exponential Moving Average) ---
+ema: true
+ema_decay: 0.999
+eval_use_ema: true

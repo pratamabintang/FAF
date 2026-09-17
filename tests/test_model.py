@@ -538,6 +538,7 @@ class TestModelArchitecture(unittest.TestCase):
             rgb_arch=rgb_arch,
             ir_arch=ir_arch,
             modal_mode='dtm_only',
+            num_classes=2,
             pretrained=False,
             input_resolution=(64, 64),
             output_resolution=(64, 64)
@@ -551,6 +552,7 @@ class TestModelArchitecture(unittest.TestCase):
             rgb_arch=rgb_arch,
             ir_arch=ir_arch,
             modal_mode='rgb_only',
+            num_classes=2,
             pretrained=False,
             input_resolution=(64, 64),
             output_resolution=(64, 64)
@@ -564,6 +566,7 @@ class TestModelArchitecture(unittest.TestCase):
             rgb_arch=rgb_arch,
             ir_arch=ir_arch,
             modal_mode='multimodal',
+            num_classes=2,
             pretrained=False,
             input_resolution=(64, 64),
             output_resolution=(64, 64)
@@ -625,7 +628,8 @@ class TestModelArchitecture(unittest.TestCase):
                 else:
                     main_out, _ = model(rgb=rgb, terrain=dtm)
 
-                self.assertEqual(main_out.shape, torch.Size([2, 2, 64, 64]))
+                expected_classes = cfg.get("num_classes", 2)
+                self.assertEqual(main_out.shape, torch.Size([2, expected_classes, 64, 64]))
                 self.assertFalse(torch.isnan(main_out).any())
 
                 loss = main_out.sum()
