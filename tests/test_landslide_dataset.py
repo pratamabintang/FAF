@@ -427,7 +427,7 @@ class TestLandslideDataset(unittest.TestCase):
 
     def test_class_weights_excludes_nodata(self):
         """Verify that calculate_class_weights filters out DTM NoData pixels."""
-        from FusionModelTrain import FusionTrainer
+        from train import FusionTrainer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             train_dir = Path(tmpdir) / "train"
@@ -474,7 +474,7 @@ class TestLandslideDataset(unittest.TestCase):
 
     def test_class_weights_fail_fast_guards(self):
         """Verify fail-fast assertions in calculate_class_weights for invalid configurations or zero landslides."""
-        from FusionModelTrain import FusionTrainer
+        from train import FusionTrainer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             train_dir = Path(tmpdir) / "train"

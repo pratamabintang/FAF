@@ -222,7 +222,7 @@ class TestModelArchitecture(unittest.TestCase):
 
     def test_loss_functions_stability(self):
         """Verify BoundaryLoss, OHEMCrossEntropyLoss, and ComboLoss3 are finite and non-negative."""
-        from FusionModelTrain import BoundaryLoss, OHEMCrossEntropyLoss, ComboLoss3, ComboLossOHEM
+        from train import BoundaryLoss, OHEMCrossEntropyLoss, ComboLoss3, ComboLossOHEM
 
         B, C, H, W = 2, 2, 32, 32
         logits = torch.randn(B, C, H, W, requires_grad=True)
@@ -267,7 +267,7 @@ class TestModelArchitecture(unittest.TestCase):
 
     def test_loss_nodata_invariance_and_empty_batch_penalty(self):
         """Verify Lovasz empty-batch false positive penalty and NoData strict invariance across losses."""
-        from FusionModelTrain import lovasz_softmax, BoundaryLoss, ComboLoss3, ComboLossOHEM
+        from train import lovasz_softmax, BoundaryLoss, ComboLoss3, ComboLossOHEM
 
         # 1. Lovasz on all-negative batch: false positives must be penalized, correct predictions near 0
         all_neg_labels = torch.zeros(1, 16, 16, dtype=torch.long)
@@ -355,7 +355,7 @@ class TestModelArchitecture(unittest.TestCase):
 
     def test_optimizer_parameter_groups_and_layerwise_decay(self):
         """Verify layer-wise decay for timm ConvNeXt, canonical terrain_prior, and unified weight decay."""
-        from FusionModelTrain import FusionTrainer
+        from train import FusionTrainer
 
         res = (64, 64)
         model = FusionModel(

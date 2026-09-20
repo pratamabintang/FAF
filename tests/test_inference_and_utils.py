@@ -14,7 +14,7 @@ import torch
 
 from FusionModelUtils import compute_results, get_palette, colorize_mask, visualize
 from FusionModel import FusionModel
-from FusionModelRunDemo import MODELS
+from eval import MODELS
 
 
 class TestInferenceAndUtils(unittest.TestCase):
@@ -218,7 +218,7 @@ class TestInferenceAndUtils(unittest.TestCase):
 
     def test_demo_cli_boolean_optional_actions(self):
         """Verify that CLI flags correctly toggle boolean flags via BooleanOptionalAction."""
-        from FusionModelRunDemo import build_parser
+        from eval import build_parser
         parser = build_parser()
         args_eval = parser.parse_args(["--have-test-labels", "--visualize"])
         self.assertTrue(args_eval.have_test_labels)

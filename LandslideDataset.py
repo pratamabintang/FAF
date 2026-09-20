@@ -524,3 +524,21 @@ class LandslideDataset(Dataset):
         mask_tensor = torch.from_numpy(mask_res).contiguous().long()
 
         return rgb_tensor, terrain_tensor, mask_tensor, sample_id
+
+
+# Export LandslideDatasetV2 for seamless access
+try:
+    from LandslideDatasetV2 import LandslideDatasetV2, build_landslide_v2_dataloader
+except ImportError:
+    LandslideDatasetV2 = None
+    build_landslide_v2_dataloader = None
+
+__all__ = [
+    "LandslideDataset",
+    "LandslideDatasetV2",
+    "build_landslide_v2_dataloader",
+    "DEFAULT_RGB_MEAN",
+    "DEFAULT_RGB_STD",
+    "DEFAULT_DTM_MEAN",
+    "DEFAULT_DTM_STD",
+]

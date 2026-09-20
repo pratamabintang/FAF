@@ -95,14 +95,14 @@ flowchart TD
 - **Complementarity-Aware Fusion Gate (CAFG):** Uses cosine distance in a learned bottleneck projection ($d_{\cos} = 1 - \langle \hat{f}_{\text{rgb}}, \hat{f}_{\text{terrain}} \rangle$) as a dynamic routing signal across modalities.
 - **Decoupled Unimodal Baselines:** Standalone `rgb_only` and `dtm_only` modes instantiate only the active backbone encoder, eliminating memory, FLOPs, and parameter inflation when establishing unimodal baselines. Supports heterogeneous backbone combinations (e.g. RGB Nano + DTM Tiny) through dynamic decoder channel routing.
 
-### 3. Stabilized Objective & Metrics (`FusionModelTrain.py`)
+### 3. Stabilized Objective & Metrics (`train.py`)
 - **Normalized Weighted Dice:** Class-weighted Dice is mathematically normalized by the sum of weights, preventing negative loss values when class weights exceed 1.0.
 - **Fail-Fast Class Weights:** Computes class weights directly from training split foreground frequencies with fail-fast assertions for zero-landslide edge cases.
 - **Target-Aware OHEM:** Online hard example mining evaluates mispredictions against true class assignments rather than unconditioned maximum prediction probabilities.
 - **True Cosine Annealing:** Standard Cosine Annealing with warmup (`torch.optim.lr_scheduler.CosineAnnealingLR`).
 - **Landslide-Centric Validation:** Best checkpoint selection tracks **Landslide IoU** (Class 1) and F1-Score rather than overall mIoU, which is overwhelmed by background (>98%).
 
-### 4. Config-Driven & Safe Inference (`FusionModelRunDemo.py`, `FusionModelUtils.py`)
+### 4. Config-Driven & Safe Inference (`eval.py`, `FusionModelUtils.py`)
 - **Dynamic Checkpoint Loading:** Model architecture (`rgb_arch`, `ir_arch`, `num_classes`, `decoder_type`, `deep_supervision`, `novel_fusion`) is dynamically reconstructed from the checkpoint's saved configuration metadata with strict state verification (`strict=True`).
 - **Correct ImageNet RGB Denormalization:** Ensures visualization grids render clear, undistorted aerial imagery.
 - **Side-by-Side Diagnostics:** Output artifacts are written safely to `runs/demo_results/` displaying RGB, DTM, Ground Truth, and Prediction Overlay.
@@ -113,7 +113,7 @@ flowchart TD
 
 ```text
 FAF(FrequencyAwareFusion)/
-├── configs/                       # Staged YAML experiment configurations (15 configurations)
+├── configs/                       # Staged YAML experiment configurations (17 configurations)
 │   ├── 01_baseline_vanilla.yaml   # FPN baseline
 │   ├── 01b_baseline_panet.yaml    # PANet baseline
 │   ├── 01c_baseline_panet_deepsup.yaml
@@ -123,12 +123,14 @@ FAF(FrequencyAwareFusion)/
 │   ├── 03a_combo_safd_cafg.yaml   # Combination: SAFD + CAFG
 │   ├── 03b_combo_safd_tpsw.yaml   # Combination: SAFD + TPSW
 │   ├── 03c_combo_cafg_tpsw.yaml   # Combination: CAFG + TPSW
-│   ├── 04_full_proposed_faf.yaml  # Full proposed method: SAFD + CAFG + TPSW + PANet
+│   ├── 04_full_proposed_faf.yaml  # Full proposed method: SAFD + CAFG + TPSW + PANet (1-Ch DTM)
 │   ├── 05_full_faf_4channel.yaml  # 4-channel terrain (DTM, Slope, Aspect)
 │   ├── 06_full_faf_ohem_boundary.yaml # OHEM + Boundary loss
 │   ├── 07_baseline_rgb_only.yaml  # Decoupled unimodal RGB baseline
 │   ├── 08_baseline_dtm_only.yaml  # Decoupled unimodal DTM baseline
-│   └── 09_ablation_local_relief.yaml # Relative local relief normalization
+│   ├── 09_ablation_local_relief.yaml # Relative local relief normalization
+│   ├── 10_baseline_mfnet_rgbt.yaml # MFNet RGB-Thermal baseline
+│   └── 11_full_faf_v2_5channel.yaml # Proposed 5-Channel FAF (RGB + DTM_NORM + SLOPE) on dataset_1V2
 ├── tools/
 │   └── verify_raster_alignment.py # Raster spatial compatibility & GeoTIFF verification tool
 ├── legacy/                        # Isolated legacy RGB-Thermal components
@@ -138,12 +140,16 @@ FAF(FrequencyAwareFusion)/
 ├── docs/                          # Architecture records & domain guidelines
 ├── tests/                         # Comprehensive automated unit test suite
 │   ├── test_landslide_dataset.py  # DTM, derivatives, NoData, sampling unit tests
+│   ├── test_landslide_dataset_v2.py # V2: Blacklist, 5-channel, ignore mask, augmentations
 │   ├── test_model.py              # SAFD, CAFG, TPSW, PANet, decoupled unimodal tests
 │   └── test_inference_and_utils.py# Strict loading, denormalization, metric tests
 ├── FusionModel.py                 # Core multimodal network & novel fusion modules
-├── LandslideDataset.py            # Multimodal RGB + DTM dataset loader
-├── FusionModelTrain.py            # Training loop, evaluation, and checkpointing
-├── FusionModelRunDemo.py          # Inference evaluation & diagnostic visualizer
+├── LandslideDataset.py            # Multimodal RGB + DTM dataset loader (V1)
+├── LandslideDatasetV2.py          # Multimodal 5-channel loader with blacklist & augmentations (V2)
+├── train.py                       # Modernized training loop, evaluation, and checkpointing
+├── eval.py                        # Modernized inference evaluation & diagnostic visualizer
+├── FusionModelTrain.py            # Backwards-compatibility wrapper -> train.py
+├── FusionModelRunDemo.py          # Backwards-compatibility wrapper -> eval.py
 ├── FusionModelUtils.py            # Metrics (IoU, F1), color palettes, plotting
 ├── requirements.txt               # Pip dependency specification
 ├── smoke_test.py                  # End-to-end model smoke test
@@ -255,30 +261,38 @@ python -m unittest discover -s tests -p "test_*.py"
 All hyperparameters, data paths, loss settings, and architectural options are organized into reproducible YAML configs under `configs/`:
 
 ```bash
-# Proposed Full Architecture (SAFD + CAFG + TPSW + PANet)
-python FusionModelTrain.py --config configs/04_full_proposed_faf.yaml
+# Proposed Full Architecture (5-Channel V2 on dataset_1V2: RGB + DTM_NORM + SLOPE)
+python train.py --config configs/11_full_faf_v2_5channel.yaml
+
+# Proposed Full Architecture (1-Channel DTM baseline on dataset_1)
+python train.py --config configs/04_full_proposed_faf.yaml
 
 # Baseline Vanilla FPN
-python FusionModelTrain.py --config configs/01_baseline_vanilla.yaml
+python train.py --config configs/01_baseline_vanilla.yaml
 
 # Unimodal RGB-Only Baseline
-python FusionModelTrain.py --config configs/07_baseline_rgb_only.yaml
+python train.py --config configs/07_baseline_rgb_only.yaml
 
 # Unimodal DTM-Only Baseline
-python FusionModelTrain.py --config configs/08_baseline_dtm_only.yaml
+python train.py --config configs/08_baseline_dtm_only.yaml
 ```
+
+> **Note on Script Names:** `FusionModelTrain.py` and `FusionModelRunDemo.py` have been streamlined to `train.py` and `eval.py`. Shims are preserved for full backwards compatibility.
 
 ### 2. Training with Command-Line Overrides
 You can override any parameter directly from the command line:
 ```powershell
-python FusionModelTrain.py `
-    --dataset landslide `
-    --data_root ./dataset/dataset_1 `
+python train.py `
+    --dataset landslide_v2 `
+    --data_root ./dataset/dataset_1V2 `
+    --channels rgb,dtm,slope `
+    --apply_blacklist `
+    --ignore_rgb_black `
     --img_height 512 `
     --img_width 512 `
     --batch_size 4 `
     --grad_accum_steps 1 `
-    --epochs 300 `
+    --epochs 100 `
     --rgb_arch convnextv2_tiny.fcmae_ft_in22k_in1k_384 `
     --ir_arch convnextv2_tiny.fcmae_ft_in22k_in1k_384 `
     --decoder_type panet `
@@ -294,9 +308,13 @@ python FusionModelTrain.py `
 ### Key Training Options
 | Argument | Default | Description |
 | :--- | :--- | :--- |
-| `--config` | `None` | Path to YAML configuration file (e.g. `configs/04_full_proposed_faf.yaml`) |
+| `--config` | `None` | Path to YAML configuration file (e.g. `configs/11_full_faf_v2_5channel.yaml`) |
+| `--dataset` | `landslide` | Dataset type: `landslide` (V1), `landslide_v2` (V2), or `mfnet` |
+| `--channels` | `rgb,dtm,slope` | Active channels for LandslideDatasetV2 (e.g. `rgb,dtm,slope` -> 5 channels) |
+| `--apply_blacklist` | `True` | Filter out noisy tile stems registered in `black_list.txt` |
+| `--ignore_rgb_black` | `True` | Ignore pure black RGB(0,0,0) void/border pixels during loss and metric calculation |
 | `--loss_type` | `combo3` | Loss function (`combo3` = Weighted CE + Dice + Lovasz; `combo_ohem` = Combo + OHEM + Boundary) |
-| `--include_derivatives` | `False` | Computes 4-channel terrain input `[DTM, Slope, Sin(Aspect), Cos(Aspect)]` |
+| `--include_derivatives` | `False` | Computes 4-channel terrain input `[DTM, Slope, Sin(Aspect), Cos(Aspect)]` (V1 only) |
 | `--pixel_scale` | `1.0` | Physical ground resolution (meters/pixel) for accurate gradient calculation |
 | `--positive_aware_sampling` | `False` | Ensures random crops center on landslide foreground pixels |
 | `--decoder_type` | `panet` | Decoder architecture: `panet` (recommended) or `fpn` |
@@ -312,17 +330,17 @@ python FusionModelTrain.py `
 Evaluate a saved checkpoint on the test split and generate side-by-side diagnostic visualization panels:
 
 ```powershell
-python FusionModelRunDemo.py `
-    --dataset landslide `
-    --data_dir ./dataset/dataset_1 `
+python eval.py `
+    --dataset landslide_v2 `
+    --data_dir ./dataset/dataset_1V2 `
     --dataset_split test `
-    --model_dir Experiments/04_full_proposed_faf `
+    --model_dir Experiments/11_full_faf_v2_5channel `
     --weight_name checkpoints `
-    --file_name best_model.ema.pth `
+    --file_name best.pth `
     --visualize
 ```
 
-> **Note:** `FusionModelRunDemo.py` automatically reads the exact backbone architecture, decoder type, and fusion parameters directly from the checkpoint's embedded configuration metadata, guaranteeing full evaluation fidelity without manual CLI flags.
+> **Note:** `eval.py` automatically reads the exact backbone architecture, decoder type, and fusion parameters directly from the checkpoint's embedded configuration metadata, guaranteeing full evaluation fidelity without manual CLI flags.
 
 ### Visualization Output (`runs/demo_results/`)
 The visualizer exports composite diagnostic images containing:

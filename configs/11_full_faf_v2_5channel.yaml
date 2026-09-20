@@ -1,0 +1,93 @@
+# ==============================================================================
+# FAF Experiment Configuration - Stage 11: Full Proposed FAF Architecture (5-Channel V2)
+# Modalities: RGB (3-Ch) + Terrain [DTM_NORM (1-Ch) + SLOPE (1-Ch)] = 5 Channels Total
+# Dataset: dataset_1V2 with Blacklist Filtering & Synchronous Data Augmentations
+# ==============================================================================
+
+# --- 1. Experiment & Logging Metadata ---
+exp_name: "11_full_faf_v2_5channel"
+exp_dir: "Experiments"
+log_interval: 10
+verbose: true
+use_wandb: false
+
+# --- 2. Determinism & Reproducibility ---
+seed: 42
+deterministic: false
+benchmark: true
+
+# --- 3. Hardware & System Configuration ---
+gpu: 0
+multi_gpu: false
+num_workers: 4
+grad_accum_steps: 1
+
+# --- 4. Dataset Configuration (LandslideDatasetV2: 5 Channels) ---
+dataset: "landslide_v2"                  # Options: "landslide_v2" | "landslide" | "mfnet"
+data_root: "./dataset/dataset_1V2"
+train_source: "train"
+val_source: "val"
+img_height: 512
+img_width: 512
+num_classes: 2                          # 0: Background, 1: Landslide
+ignore_unlabeled: false
+
+# V2 Channel Selection & Blacklist Options
+channels: ["rgb", "dtm", "slope"]       # 3 RGB channels + 2 Terrain channels = 5 channels total
+apply_blacklist: true                   # Skip noisy tiles listed in black_list.txt
+blacklist_path: "dataset/dataset_1V2/black_list.txt"
+ignore_rgb_black: true                  # Mask RGB(0,0,0) border/void pixels with ignore_index (-100)
+ignore_index: -100
+
+# Sampling & Cropping
+positive_aware_sampling: true           # Centers crop around landslide pixels
+positive_sample_prob: 0.5               # Probability of positive-centered crop
+positive_aware_sampler: false           # Dataset-level WeightedRandomSampler
+
+# --- 5. Model Architecture & Multimodal Modules ---
+rgb_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+ir_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
+context_dim: "[96,192,384,768]"
+freeze_backbones: false
+
+# Decoder & Attention Modules
+decoder_type: "panet"                  # Options: "fpn" | "panet"
+deep_supervision: true
+enhanced_fusion: false
+use_safd: true                        # Scene-Adaptive Frequency Decomposition
+use_cafg: true                        # Complementarity-Aware Fusion Gate
+use_tpsw: true                        # Topographic Prior-Guided Spatial Weighting
+
+# --- 6. Optimization, Scheduler & Loss Functions ---
+epochs: 100
+batch_size: 4
+optimizer: "adamw"
+lr_backbone: 3.0e-5
+lr_fusion: 3.0e-4
+lr_decoder: 3.0e-4
+weight_decay: 0.01
+clip_grad: 1.0
+
+scheduler: "cosine"
+warmup_epochs: 5
+
+# Loss function
+loss_type: "combo3"
+ce_weight: 0.5
+dice_weight: 0.5
+lovasz_weight: 0.0
+class_weights: true
+class_weight_multiplier: 10.0
+
+# Deep Supervision auxiliary weight
+aux_weight_start: 0.4
+aux_weight_end: 0.1
+aux_weight_decay_epoch: 60
+
+# Model EMA
+ema: true
+ema_decay: 0.999
+eval_use_ema: true
+
+# Checkpoint Saving Interval
+save_interval: 5
