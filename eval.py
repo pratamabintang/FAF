@@ -1,4 +1,5 @@
 import os, argparse, time, datetime, sys, shutil, stat, torch
+from pathlib import Path
 import numpy as np 
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
@@ -33,9 +34,17 @@ MODELS = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Test with pytorch')
+    parser.add_argument('--checkpoint', '-c', type=str, default=None,
+                        help='Direct path to model checkpoint file (e.g. runs/11_full_faf_v2_5channel/checkpoints/best_model.ema.pth)')
+    parser.add_argument('--config', type=str, default='',
+                        help='Path to YAML or JSON evaluation configuration file (e.g. configs/eval_11_full_faf_v2_5channel.yaml)')
     parser.add_argument('--model_name', '-m', type=str, default='FusionModel')
     parser.add_argument('--weight_name', '-w', type=str, default='checkpoints')
     parser.add_argument('--file_name', '-f', type=str, default='best_model.ema.pth')
+    parser.add_argument('--batch_size', '-b', type=int, default=1,
+                        help='Evaluation batch size (default: 1)')
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Directory to save prediction visualizations and metrics')
     parser.add_argument('--dataset_split', '-d', type=str, default='test') # test, val, test_day, test_night
     parser.add_argument('--have-test-labels', '--have_test_labels', '-htl',
                         action=argparse.BooleanOptionalAction, default=True,
@@ -154,7 +163,46 @@ def tta_inference(model, rgb, ir, scales=[1.0], do_flip=False, output_size=(480,
 def main(args=None):
     if args is None:
         parser = build_parser()
+
+        # Pre-parse --config so that YAML/JSON provides base defaults, while explicit CLI args take precedence
+        temp_parser = argparse.ArgumentParser(add_help=False)
+        temp_parser.add_argument('--config', type=str, default='')
+        known_args, _ = temp_parser.parse_known_args()
+
+        cfg_dict = {}
+        if known_args.config:
+            config_path = known_args.config
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(f"Config file not found: {config_path}")
+            if config_path.endswith(('.yaml', '.yml')):
+                import yaml
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    cfg_dict = yaml.safe_load(f) or {}
+            elif config_path.endswith('.json'):
+                import json
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    cfg_dict = json.load(f) or {}
+            else:
+                raise ValueError(f"Unsupported config format: {config_path}. Use .yaml, .yml or .json")
+            
+            # Auto-map common training config fields to eval args if not explicitly given
+            if 'exp_dir' in cfg_dict and 'exp_name' in cfg_dict and 'model_dir' not in cfg_dict:
+                cfg_dict['model_dir'] = os.path.join(cfg_dict['exp_dir'], cfg_dict['exp_name'])
+            if 'data_root' in cfg_dict and 'data_dir' not in cfg_dict:
+                cfg_dict['data_dir'] = cfg_dict['data_root']
+            if 'val_source' in cfg_dict and 'dataset_split' not in cfg_dict:
+                cfg_dict['dataset_split'] = cfg_dict['val_source']
+            if 'num_classes' in cfg_dict and 'n_class' not in cfg_dict:
+                cfg_dict['n_class'] = cfg_dict['num_classes']
+
+            parser.set_defaults(**cfg_dict)
+            print(f"[INFO] Loaded evaluation config from: {config_path}")
+
         args = parser.parse_args()
+
+        for k, v in cfg_dict.items():
+            if not hasattr(args, k):
+                setattr(args, k, v)
   
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
@@ -167,20 +215,37 @@ def main(args=None):
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
-    # Prepare isolated demo output directory (preserve existing runs)
-    save_demo_dir = os.path.join("./runs", "demo_results")
+    # Resolve model checkpoint file
+    if getattr(args, 'checkpoint', None):
+        model_file = args.checkpoint
+        if not os.path.exists(model_file):
+            sys.exit(f"Checkpoint file not found at: {model_file}")
+    else:
+        model_dir = os.path.join(args.model_dir, args.weight_name)
+        if not os.path.exists(model_dir):
+            sys.exit(f"The model directory {model_dir} does not exist.")
+        model_file = os.path.join(model_dir, args.file_name)
+        if not os.path.exists(model_file):
+            fallback = os.path.join(model_dir, "best.pth")
+            if os.path.exists(fallback):
+                print(f"[INFO] '{args.file_name}' not found, falling back to '{fallback}'.")
+                model_file = fallback
+            else:
+                sys.exit(f"No checkpoint file found at: {model_file} or {fallback}")
+
+    # Prepare output directory for evaluation and visualization results
+    if getattr(args, 'save_dir', None):
+        save_demo_dir = args.save_dir
+    elif getattr(args, 'checkpoint', None):
+        ckpt_stem = Path(args.checkpoint).parent.parent.name
+        save_demo_dir = os.path.join("./runs", "eval_results", ckpt_stem)
+    else:
+        save_demo_dir = os.path.join(args.model_dir, "eval_results", args.dataset_split)
     os.makedirs(save_demo_dir, exist_ok=True)
     try:
         os.chmod(save_demo_dir, stat.S_IRWXU)
     except Exception:
         pass
-
-    model_dir = os.path.join(args.model_dir, args.weight_name)
-    if not os.path.exists(model_dir):
-        sys.exit(f"The model directory {model_dir} does not exist.")
-    model_file = os.path.join(model_dir, args.file_name)
-    if not os.path.exists(model_file):
-        sys.exit(f"No checkpoint file found at: {model_file}")
 
     print(f"Testing {args.model_name}: {args.weight_name} on {device} with PyTorch")
     print(f"Loading checkpoint file: {model_file} ...")
@@ -370,7 +435,7 @@ def main(args=None):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
         
-    batch_size = 1
+    batch_size = getattr(args, 'batch_size', 1)
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,

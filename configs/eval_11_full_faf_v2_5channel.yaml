@@ -1,0 +1,48 @@
+# ==============================================================================
+# FAF Evaluation Configuration - Stage 11: Full Proposed FAF Architecture (V2)
+# Modalities: RGB (3-Ch) + Terrain [DTM_NORM (1-Ch) + SLOPE (1-Ch)] = 5 Channels Total
+# Dataset: dataset_1V2 (Test or Val Split)
+# ==============================================================================
+
+# --- 1. Checkpoint & Model Settings ---
+# You can specify a direct checkpoint path:
+checkpoint: "runs/11_full_faf_v2_5channel/checkpoints/best_model.ema.pth"
+
+# Or configure directory navigation (used if checkpoint is omitted):
+model_dir: "runs/11_full_faf_v2_5channel"
+weight_name: "checkpoints"
+file_name: "best_model.ema.pth"             # Will fallback to best.pth if EMA file is absent
+model_name: "FusionModel"
+
+# --- 2. Dataset & Split Settings ---
+dataset: "landslide_v2"                    # Options: "landslide_v2" | "landslide" | "mfnet" | "pst900"
+data_dir: "./dataset/dataset_1V2"
+dataset_split: "test"                      # Options: "test" | "val"
+have_test_labels: true                     # Compute IoU, Recall, Precision, F1 against ground truth
+
+# V2 Channel Selection & Blacklist Options
+channels: ["rgb", "dtm", "slope"]          # 5 channels total (must match trained model)
+apply_blacklist: true                      # Skip noisy tiles listed in black_list.txt
+blacklist_path: "dataset/dataset_1V2/black_list.txt"
+ignore_rgb_black: true                     # Mask RGB(0,0,0) void pixels with ignore_index (-100)
+ignore_index: -100
+
+# Input Dimensions & Classes
+img_height: 512
+img_width: 512
+n_class: 2                                 # 0: Background, 1: Landslide
+
+# --- 3. Inference & Hardware ---
+gpu: 0
+num_workers: 4
+batch_size: 1
+
+# --- 4. Test-Time Augmentation (TTA) & Adaptation ---
+tta: false                                 # Set true for multi-scale flip inference (+0.5-1.5% IoU boost)
+tta_scales: [0.75, 1.0, 1.25]
+tta_flip: true
+use_tent: false                            # Set true for Test-time Entropy Minimization
+
+# --- 5. Output & Visualizations ---
+visualize: true                            # Save side-by-side diagnostic prediction panels
+save_dir: "./runs/eval_results/11_full_faf_v2_5channel"
