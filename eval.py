@@ -298,6 +298,30 @@ def main(args=None):
     else:
         ir_in_chans = 4 if include_derivatives else ckpt_config.get("ir_in_chans", getattr(args, "ir_in_chans", 1))
 
+    # Recover context_dim, resolution and dataset_type from checkpoint/args
+    if "context_dim" in ckpt_config:
+        raw_cd = ckpt_config["context_dim"]
+        if isinstance(raw_cd, str):
+            ctx_dim = [int(x.strip()) for x in raw_cd.strip('[]').split(',')]
+        else:
+            ctx_dim = list(raw_cd)
+    else:
+        ctx_dim = [int(x.strip()) for x in args.context_dim.strip('[]').split(',')]
+
+    img_h = ckpt_config.get("img_height", args.img_height)
+    img_w = ckpt_config.get("img_width", args.img_width)
+    resolution = (img_h, img_w)
+    dataset_type = getattr(args, "dataset", None) or ckpt_config.get("dataset", "landslide_v2")
+
+    # Dynamic DTM preprocessing and NoData extraction from checkpoint configuration
+    dtm_norm = args.dtm_norm if args.dtm_norm is not None else ckpt_config.get("dtm_norm", "standard")
+    dtm_mean = args.dtm_mean if args.dtm_mean is not None else ckpt_config.get("dtm_mean", 72.82)
+    dtm_std = args.dtm_std if args.dtm_std is not None else ckpt_config.get("dtm_std", 58.01)
+    nodata_value = args.nodata_value if args.nodata_value is not None else ckpt_config.get("nodata_value", -9999.0)
+    ignore_index = args.ignore_index if args.ignore_index is not None else ckpt_config.get("ignore_index", -100)
+    ignore_nodata = ckpt_config.get("ignore_nodata", True)
+    pixel_scale = ckpt_config.get("pixel_scale", 1.0)
+
     # Synchronize args with checkpoint configuration
     args.n_class = num_classes
     args.dataset = dataset_type
