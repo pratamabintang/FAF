@@ -1,12 +1,12 @@
 # ==============================================================================
-# FAF Experiment Configuration - Stage 11: Full Proposed FAF Architecture (5-Channel V2)
-# Modalities: RGB (3-Ch) + Terrain [DTM_NORM (1-Ch) + SLOPE (1-Ch)] = 5 Channels Total
-# Dataset: dataset_1V2 with Blacklist Filtering & Synchronous Data Augmentations
+# FAF Experiment Configuration - Stage 13: Unimodal Baseline (DTM + Slope on dataset_1V2)
+# Modalities: DTM (1-Channel) + Slope (1-Channel) = 2 Channels Total
+# Evaluates elevation/terrain morphology alone with blacklist filtering & augmentations
 # ==============================================================================
 
 # --- 1. Experiment & Logging Metadata ---
-exp_name: "11_full_faf_v2_5channel"
-exp_dir: "Experiments"
+exp_name: "13_baseline_v2_dtm_slope"
+exp_dir: "runs"
 log_interval: 10
 verbose: true
 use_wandb: false
@@ -22,8 +22,8 @@ multi_gpu: false
 num_workers: 4
 grad_accum_steps: 1
 
-# --- 4. Dataset Configuration (LandslideDatasetV2: 5 Channels) ---
-dataset: "landslide_v2"                  # Options: "landslide_v2" | "landslide" | "mfnet"
+# --- 4. Dataset Configuration (LandslideDatasetV2: DTM + Slope) ---
+dataset: "landslide_v2"
 data_root: "./dataset/dataset_1V2"
 train_source: "train"
 val_source: "val"
@@ -32,11 +32,11 @@ img_width: 512
 num_classes: 2                          # 0: Background, 1: Landslide
 ignore_unlabeled: false
 
-# V2 Channel Selection & Blacklist Options
-channels: ["rgb", "dtm", "slope"]       # 3 RGB channels + 2 Terrain channels = 5 channels total
+# Channel Selection & Blacklist Options
+channels: ["dtm", "slope"]              # Terrain elevation + slope channels
 apply_blacklist: true                   # Skip noisy tiles listed in black_list.txt
 blacklist_path: "dataset/dataset_1V2/black_list.txt"
-ignore_rgb_black: true                  # Mask RGB(0,0,0) border/void pixels with ignore_index (-100)
+ignore_rgb_black: false
 ignore_index: -100
 
 # Sampling & Cropping
@@ -44,20 +44,20 @@ positive_aware_sampling: true           # Centers crop around landslide pixels
 positive_sample_prob: 0.5               # Probability of positive-centered crop
 positive_aware_sampler: false           # Dataset-level WeightedRandomSampler
 
-# --- 5. Model Architecture & Multimodal Modules ---
+# --- 5. Model Architecture & Modality Operating Mode ---
 rgb_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
 ir_arch: "convnextv2_tiny.fcmae_ft_in22k_in1k_384"
 context_dim: "[96,192,384,768]"
-modal_mode: "multimodal"                  # Options: "multimodal" | "rgb_only" | "dtm_only"
+modal_mode: "dtm_only"                  # Dedicated unimodal DTM/Terrain mode (rgb_encoder is inactive)
 freeze_backbones: false
 
 # Decoder & Attention Modules
-decoder_type: "panet"                  # Options: "fpn" | "panet"
+decoder_type: "panet"                   # Options: "fpn" | "panet"
 deep_supervision: true
 enhanced_fusion: false
-use_safd: true                        # Scene-Adaptive Frequency Decomposition
-use_cafg: true                        # Complementarity-Aware Fusion Gate
-use_tpsw: true                        # Topographic Prior-Guided Spatial Weighting
+use_safd: false                         # Disabled for unimodal
+use_cafg: false                         # Disabled for unimodal
+use_tpsw: false                         # Disabled for unimodal
 
 # --- 6. Optimization, Scheduler & Loss Functions ---
 epochs: 100
@@ -65,30 +65,34 @@ batch_size: 4
 optimizer: "adamw"
 lr_backbone: 3.0e-5
 lr_fusion: 3.0e-4
-lr_decoder: 3.0e-4
+learning_rate: 3.0e-4
 weight_decay: 0.01
-clip_grad: 1.0
-
+layer_decay: 0.90
 scheduler: "cosine"
+min_lr: 1.0e-6
 warmup_epochs: 5
 
-# Loss function
-loss_type: "combo3"
-ce_weight: 0.5
-dice_weight: 0.5
-lovasz_weight: 0.0
+loss_type: "combo3"                     # CE + Dice + Lovasz
+ce_weight: 0.4
+dice_weight: 0.3
+lovasz_weight: 0.3
 class_weights: true
 class_weight_multiplier: 10.0
 
-# Deep Supervision auxiliary weight
-aux_weight_start: 0.4
-aux_weight_end: 0.1
-aux_weight_decay_epoch: 60
+# Auxiliary Loss (Deep Supervision)
+aux_weight_start: 0.3
+aux_weight_end: 0.05
+aux_weight_decay_epoch: 80
 
-# Model EMA
+# --- 7. Regularization, EMA & Evaluation ---
 ema: true
 ema_decay: 0.999
 eval_use_ema: true
-
-# Checkpoint Saving Interval
+eval_interval: 1
 save_interval: 5
+early_stopping: false
+patience: 15
+min_delta: 0.001
+save_best_metric: "miou"
+save_top_k: 3
+metric_types: ["miou", "f1", "precision", "recall"]

@@ -141,6 +141,36 @@ class TestLandslideDatasetV2(unittest.TestCase):
         self.assertEqual(mask_b.shape, (4, 512, 512))
         self.assertEqual(len(stems), 4)
 
+    def test_07_unimodal_rgb_dataloader(self):
+        """Verifies DataLoader batch creation when channels=['rgb'] (dummy terrain placeholder)."""
+        loader = build_landslide_v2_dataloader(
+            data_dir=self.data_dir,
+            split="train",
+            batch_size=2,
+            channels=["rgb"],
+            num_workers=0,
+        )
+        self.assertGreater(len(loader), 0)
+        rgb_b, ter_b, mask_b, stems = next(iter(loader))
+        self.assertEqual(rgb_b.shape, (2, 3, 512, 512))
+        self.assertEqual(ter_b.shape, (2, 1, 512, 512))
+        self.assertEqual(mask_b.shape, (2, 512, 512))
+
+    def test_08_unimodal_dtm_slope_dataloader(self):
+        """Verifies DataLoader batch creation when channels=['dtm', 'slope'] (dummy rgb placeholder)."""
+        loader = build_landslide_v2_dataloader(
+            data_dir=self.data_dir,
+            split="train",
+            batch_size=2,
+            channels=["dtm", "slope"],
+            num_workers=0,
+        )
+        self.assertGreater(len(loader), 0)
+        rgb_b, ter_b, mask_b, stems = next(iter(loader))
+        self.assertEqual(rgb_b.shape, (2, 3, 512, 512))
+        self.assertEqual(ter_b.shape, (2, 2, 512, 512))
+        self.assertEqual(mask_b.shape, (2, 512, 512))
+
 
 if __name__ == "__main__":
     unittest.main()

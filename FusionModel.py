@@ -86,6 +86,15 @@ class FusionModel(nn.Module):
         is_rgb_active = (self.modal_mode not in ("dtm_only", "ir_only"))
         is_dtm_active = (self.modal_mode != "rgb_only")
 
+        # Defensive validation against ZeroDivisionError in timm conv weight adapt
+        if is_dtm_active and (effective_terrain_in_chans is None or effective_terrain_in_chans <= 0):
+            raise ValueError(
+                f"[FusionModel ERROR] 'ir_in_chans' must be >= 1 when DTM/terrain encoder is active (modal_mode='{self.modal_mode}'). "
+                f"Got ir_in_chans={effective_terrain_in_chans}. For unimodal RGB-only experiments, please set modal_mode='rgb_only'."
+            )
+        if not is_dtm_active:
+            effective_terrain_in_chans = max(1, effective_terrain_in_chans or 1)
+
         if is_rgb_active:
             self.rgb_encoder = timm.create_model(
                 rgb_arch,

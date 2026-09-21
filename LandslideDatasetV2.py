@@ -744,6 +744,14 @@ class LandslideDatasetV2(Dataset):
             return concat_tensor, mask_tensor, sample_id
 
         # Standard dual-stream format for FAF FusionModel: (rgb, terrain, mask, sample_id)
+        # When a modality stream is inactive, provide a zero tensor placeholder
+        # ([3, H, W] for RGB, [1, H, W] for terrain) to ensure PyTorch DataLoader
+        # default_collate and device transfer execute seamlessly without NoneType errors.
+        if rgb_tensor is None:
+            rgb_tensor = torch.zeros((3, self.target_h, self.target_w), dtype=torch.float32)
+        if terrain_tensor is None:
+            terrain_tensor = torch.zeros((1, self.target_h, self.target_w), dtype=torch.float32)
+
         return rgb_tensor, terrain_tensor, mask_tensor, sample_id
 
 

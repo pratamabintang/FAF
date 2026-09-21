@@ -203,31 +203,35 @@ def main(args=None):
     use_cafg = ckpt_config.get("use_cafg", args.use_cafg)
     use_tpsw = ckpt_config.get("use_tpsw", args.use_tpsw)
     include_derivatives = ckpt_config.get("include_derivatives", getattr(args, "include_derivatives", False))
-    ir_in_chans = 4 if include_derivatives else ckpt_config.get("ir_in_chans", getattr(args, "ir_in_chans", 1))
-
-    if "context_dim" in ckpt_config:
-        raw_cd = ckpt_config["context_dim"]
-        if isinstance(raw_cd, str):
-            ctx_dim = [int(x.strip()) for x in raw_cd.strip('[]').split(',')]
+    raw_channels = getattr(args, "channels", None) or ckpt_config.get("channels", None)
+    if raw_channels is not None:
+        if isinstance(raw_channels, str):
+            eval_chans = [c.strip().lower() for c in raw_channels.split(',') if c.strip()]
         else:
-            ctx_dim = list(raw_cd)
+            eval_chans = [str(c).strip().lower() for c in raw_channels]
+        terrain_chans = [c for c in eval_chans if c not in ('rgb', 'image')]
+        has_rgb = any(c in ('rgb', 'image') for c in eval_chans)
+        has_terrain = len(terrain_chans) > 0
     else:
-        ctx_dim = [int(x.strip()) for x in args.context_dim.strip('[]').split(',')]
+        eval_chans = ['rgb', 'dtm', 'slope'] if '1v2' in str(args.data_dir).lower() else ['rgb', 'dtm']
+        terrain_chans = [c for c in eval_chans if c not in ('rgb', 'image')]
+        has_rgb = True
+        has_terrain = True
 
-    img_h = ckpt_config.get("img_height", args.img_height)
-    img_w = ckpt_config.get("img_width", args.img_width)
-    resolution = (img_h, img_w)
-    dataset_type = ckpt_config.get("dataset", args.dataset)
+    modal_mode = getattr(args, "modal_mode", None) or ckpt_config.get("modal_mode", None)
+    if has_rgb and not has_terrain:
+        modal_mode = 'rgb_only'
+    elif has_terrain and not has_rgb:
+        modal_mode = 'dtm_only'
+    elif modal_mode is None:
+        modal_mode = "multimodal"
 
-    # Dynamic DTM preprocessing and NoData extraction from checkpoint configuration
-    dtm_norm = args.dtm_norm if args.dtm_norm is not None else ckpt_config.get("dtm_norm", "standard")
-    dtm_mean = args.dtm_mean if args.dtm_mean is not None else ckpt_config.get("dtm_mean", 72.82)
-    dtm_std = args.dtm_std if args.dtm_std is not None else ckpt_config.get("dtm_std", 58.01)
-    nodata_value = args.nodata_value if args.nodata_value is not None else ckpt_config.get("nodata_value", -9999.0)
-    ignore_index = args.ignore_index if args.ignore_index is not None else ckpt_config.get("ignore_index", -100)
-    ignore_nodata = ckpt_config.get("ignore_nodata", True)
-    pixel_scale = ckpt_config.get("pixel_scale", 1.0)
-    modal_mode = getattr(args, "modal_mode", None) or ckpt_config.get("modal_mode", "multimodal")
+    if modal_mode == "rgb_only":
+        ir_in_chans = 0
+    elif modal_mode in ("dtm_only", "ir_only") or has_terrain:
+        ir_in_chans = len(terrain_chans) if terrain_chans else (4 if include_derivatives else 1)
+    else:
+        ir_in_chans = 4 if include_derivatives else ckpt_config.get("ir_in_chans", getattr(args, "ir_in_chans", 1))
 
     # Synchronize args with checkpoint configuration
     args.n_class = num_classes

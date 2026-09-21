@@ -440,6 +440,9 @@ class FusionTrainer:
         # Set random seeds
         self.set_seed(config.seed)
 
+        # Resolve modality mode and input channels dynamically
+        self._resolve_modality_config()
+
         # Audit and clarify configuration fields
         self._audit_configuration()
 
@@ -489,12 +492,61 @@ class FusionTrainer:
         else:
             print(f"[THROUGHPUT] Seed={seed} | CUDNN Benchmark=True | Deterministic=False")
 
+    def _resolve_modality_config(self):
+        """
+        Dynamically resolves channels, modal_mode, and ir_in_chans based on dataset and CLI/config settings.
+        Guarantees that unimodal experiments (e.g. RGB only or DTM only) configure modal_mode appropriately
+        and prevents ZeroDivisionError in backbone weight adaptation.
+        """
+        raw_chans = getattr(self.config, 'channels', None)
+        if raw_chans is not None:
+            if isinstance(raw_chans, str):
+                chans_list = [c.strip().lower() for c in raw_chans.split(',') if c.strip()]
+            else:
+                chans_list = [str(c).strip().lower() for c in raw_chans]
+        elif self.config.dataset in ('landslide_v2',) or '1v2' in str(getattr(self.config, 'data_root', '')).lower():
+            chans_list = ['rgb', 'dtm', 'slope']
+        else:
+            chans_list = ['rgb', 'dtm']
+
+        terrain_chans = [c for c in chans_list if c not in ('rgb', 'image')]
+        has_rgb = any(c in ('rgb', 'image') for c in chans_list)
+        has_terrain = len(terrain_chans) > 0
+
+        configured_modal_mode = getattr(self.config, 'modal_mode', None)
+        if configured_modal_mode:
+            configured_modal_mode = str(configured_modal_mode).lower().strip()
+
+        # Automatic deduction of modal_mode based on channel availability
+        if has_rgb and not has_terrain:
+            modal_mode = 'rgb_only'
+        elif has_terrain and not has_rgb:
+            modal_mode = 'dtm_only'
+        elif configured_modal_mode in ('rgb_only', 'dtm_only', 'multimodal'):
+            modal_mode = configured_modal_mode
+        else:
+            modal_mode = 'multimodal'
+
+        include_derivatives = getattr(self.config, 'include_derivatives', False)
+        if modal_mode == 'rgb_only':
+            ir_in_chans = 0
+        elif modal_mode in ('dtm_only', 'ir_only') or has_terrain:
+            ir_in_chans = len(terrain_chans) if terrain_chans else (4 if include_derivatives else 1)
+        else:
+            ir_in_chans = 4 if include_derivatives else getattr(self.config, 'ir_in_chans', 1)
+
+        self.config.channels = chans_list
+        self.config.modal_mode = modal_mode
+        self.config.ir_in_chans = ir_in_chans
+
     def _audit_configuration(self):
         """Audits configuration parameters, logging active FAF options and clarifying legacy/no-op fields."""
+        mode_label = getattr(self.config, 'modal_mode', 'multimodal').upper()
         print("=" * 80)
-        print("CONFIGURATION AUDIT: MULTIMODAL FREQUENCY-AWARE FUSION (FAF)")
+        print(f"CONFIGURATION AUDIT: {mode_label} FREQUENCY-AWARE FUSION (FAF)")
         print("=" * 80)
-        print(f"  Modality Backbones: RGB={self.config.rgb_arch} | Terrain/DTM={self.config.ir_arch}")
+        print(f"  Modality Mode     : {getattr(self.config, 'modal_mode', 'multimodal')} | Active Channels: {getattr(self.config, 'channels', 'default')}")
+        print(f"  Modality Backbones: RGB={self.config.rgb_arch} | Terrain/DTM={self.config.ir_arch} (ir_in_chans={getattr(self.config, 'ir_in_chans', 0)})")
         print(f"  Proposed Modules  : SAFD={getattr(self.config, 'use_safd', False)} | CAFG={getattr(self.config, 'use_cafg', False)} | TPSW={getattr(self.config, 'use_tpsw', False)}")
         print(f"  Input Resolution  : {self.config.img_height}x{self.config.img_width} | Classes={self.config.num_classes}")
         print(f"  Loss & Optimizer  : Type={self.config.loss_type} | Base WD={getattr(self.config, 'weight_decay', 0.01)}")
@@ -532,22 +584,6 @@ class FusionTrainer:
         use_safd = getattr(self.config, 'use_safd', False)
         use_cafg = getattr(self.config, 'use_cafg', False)
         use_tpsw = getattr(self.config, 'use_tpsw', False)
-        # Determine terrain / ir channels dynamically
-        include_derivatives = getattr(self.config, 'include_derivatives', False)
-        if getattr(self.config, 'channels', None) is not None:
-            raw_chans = self.config.channels
-            if isinstance(raw_chans, str):
-                chans_list = [c.strip().lower() for c in raw_chans.split(',') if c.strip()]
-            else:
-                chans_list = [str(c).strip().lower() for c in raw_chans]
-            terrain_chans = [c for c in chans_list if c not in ('rgb', 'image')]
-            ir_in_chans = len(terrain_chans)
-        elif self.config.dataset in ('landslide_v2',) or '1v2' in str(getattr(self.config, 'data_root', '')).lower():
-            ir_in_chans = getattr(self.config, 'ir_in_chans', 2)  # Default V2: DTM + Slope = 2
-        else:
-            ir_in_chans = 4 if include_derivatives else getattr(self.config, 'ir_in_chans', 1)
-        self.config.ir_in_chans = ir_in_chans
-        modal_mode = getattr(self.config, 'modal_mode', 'multimodal')
         
         model = FusionModel(
             rgb_arch=self.config.rgb_arch,
@@ -564,8 +600,8 @@ class FusionTrainer:
             use_safd=use_safd,
             use_cafg=use_cafg,
             use_tpsw=use_tpsw,
-            ir_in_chans=ir_in_chans,
-            modal_mode=modal_mode
+            ir_in_chans=self.config.ir_in_chans,
+            modal_mode=self.config.modal_mode
         )
         
         model = model.to(self.device)
@@ -1125,8 +1161,10 @@ class FusionTrainer:
                     f"Expected classes in [0, {self.config.num_classes - 1}] or ignore_index ({ignore_idx})."
                 )
 
-            rgb = rgb.to(device=self.device)
-            ir = ir.to(device=self.device)
+            if rgb is not None:
+                rgb = rgb.to(device=self.device)
+            if ir is not None:
+                ir = ir.to(device=self.device)
             masks = masks.to(device=self.device)
             
             with autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
@@ -1216,8 +1254,10 @@ class FusionTrainer:
                 if self.config.dataset not in ('landslide', 'landslide_v2') and (masks == 255).any():
                     masks = masks.clone()
                     masks[masks == 255] = -100
-                rgb = rgb.to(self.device)
-                ir = ir.to(self.device) 
+                if rgb is not None:
+                    rgb = rgb.to(self.device)
+                if ir is not None:
+                    ir = ir.to(self.device) 
                 masks = masks.to(self.device)
                 
                 with autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
@@ -1675,14 +1715,21 @@ def main():
     parser.add_argument('--focal_target_class', type=int, default=-1, help='Target class for Focal Loss (-1=all classes, 3=Hand Drill for PST900, 6=Guardrail for MFNet)')
 
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps.')
+    parser.add_argument('--modal_mode', type=str, default=None,
+        choices=['multimodal', 'rgb_only', 'dtm_only'],
+        help='Modality operating mode: multimodal, rgb_only, or dtm_only. Inferred from channels if not specified.')
     parser.add_argument('--config', type=str, default='',
                         help='Path to YAML or JSON experiment configuration file (e.g. configs/04_full_proposed_faf.yaml)')
 
-    args = parser.parse_args()
-    
-    # Load from config file if specified
-    if args.config:
-        config_path = args.config
+    # Pre-parse --config so that YAML/JSON provides base defaults,
+    # and any explicit CLI options (e.g. --channels rgb, --batch_size 8) take precedence
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument('--config', type=str, default='')
+    known_args, _ = temp_parser.parse_known_args()
+
+    cfg_dict = {}
+    if known_args.config:
+        config_path = known_args.config
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
         
@@ -1699,9 +1746,15 @@ def main():
         else:
             raise ValueError(f"Unsupported config format: {config_path}. Use .yaml, .yml or .json")
         
-        for k, v in cfg_dict.items():
-            setattr(args, k, v)
+        parser.set_defaults(**cfg_dict)
         print(f"[INFO] Loaded reproducible experiment config from: {config_path}")
+
+    args = parser.parse_args()
+
+    # Assign any non-parser keys present in cfg_dict (e.g. custom metadata)
+    for k, v in cfg_dict.items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
 
     # Set experiment name if not provided
     if args.exp_name is None:
